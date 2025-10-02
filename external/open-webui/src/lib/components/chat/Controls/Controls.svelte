@@ -8,6 +8,8 @@
 	import Valves from '$lib/components/chat/Controls/Valves.svelte';
 	import FileItem from '$lib/components/common/FileItem.svelte';
 	import Collapsible from '$lib/components/common/Collapsible.svelte';
+	import Tooltip from '$lib/components/common/Tooltip.svelte';
+	import ExtendedThinking from '$lib/components/icons/ExtendedThinking.svelte';
 
 	import { user, settings } from '$lib/stores';
 	export let models = [];
@@ -15,19 +17,62 @@
 	export let params = {};
 
 	let showValves = false;
+	let extendedThinkingActive = false;
+
+	const ensureParams = () => {
+		if (!params || typeof params !== 'object') {
+			params = {};
+		}
+	};
+
+	const toggleExtendedThinking = () => {
+		ensureParams();
+		const nextEffort = extendedThinkingActive ? null : 'high';
+		const updatedParams = { ...(params ?? {}) };
+		if (nextEffort === null) {
+			delete updatedParams.reasoning_effort;
+		} else {
+			updatedParams.reasoning_effort = nextEffort;
+		}
+		params = updatedParams;
+	};
+
+	$: extendedThinkingActive = (params?.reasoning_effort ?? null) === 'high';
 </script>
 
 <div class=" dark:text-white">
-	<div class=" flex items-center justify-between dark:text-gray-100 mb-2">
+	<div class=" flex items-center justify-between dark:text-gray-100 mb-2 gap-2">
 		<div class=" text-lg font-medium self-center font-primary">{$i18n.t('Chat Controls')}</div>
-		<button
-			class="self-center"
-			on:click={() => {
-				dispatch('close');
-			}}
-		>
-			<XMark className="size-3.5" />
-		</button>
+		<div class="flex items-center gap-1.5">
+			<Tooltip content={$i18n.t('Set reasoning effort to high for this chat.')} placement="top">
+				<button
+					type="button"
+					class={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-secondary-200 border ${
+						extendedThinkingActive
+							? 'bg-accent-secondary-100/[18%] text-accent-secondary-000 border-accent-secondary-200/40'
+							: 'bg-accent-secondary-100/[8%] text-accent-secondary-100 border-accent-secondary-200/20 hover:bg-accent-secondary-100/[12%] hover:text-accent-secondary-000'
+					}`}
+					on:click={toggleExtendedThinking}
+					aria-pressed={extendedThinkingActive}
+				>
+					<ExtendedThinking
+						className="size-4"
+						title={extendedThinkingActive
+							? $i18n.t('Extended Thinking enabled')
+							: $i18n.t('Extended Thinking')}
+					/>
+					<span>{$i18n.t('Extended Thinking')}</span>
+				</button>
+			</Tooltip>
+			<button
+				class="self-center"
+				on:click={() => {
+					dispatch('close');
+				}}
+			>
+				<XMark className="size-3.5" />
+			</button>
+		</div>
 	</div>
 
 	{#if $user?.role === 'admin' || ($user?.permissions.chat?.controls ?? true)}
