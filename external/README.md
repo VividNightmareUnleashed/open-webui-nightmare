@@ -3,6 +3,7 @@
 This folder collects all Open WebUI reference material.
 
 - `open-webui/` is a read-only snapshot of the upstream project. Do **not** edit files inside this directory.
+- `openwebui-docs/` is a clone of the official documentation site (https://github.com/open-webui/docs). Update with `git pull` inside this directory.
 - `*_GUIDE.md` files summarise helper modules from `backend/open_webui/utils/`.
   If you inspect the source under `open-webui/` and notice new behaviour, update the corresponding guide.
 
