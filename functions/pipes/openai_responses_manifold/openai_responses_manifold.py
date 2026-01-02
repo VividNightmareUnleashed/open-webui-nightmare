@@ -21,6 +21,7 @@ import textwrap
 from typing import Tuple
 import asyncio
 import datetime
+from dataclasses import dataclass
 import inspect
 import json
 import logging
@@ -69,6 +70,17 @@ DETAILS_RE = re.compile(
     r"<details\b[^>]*>.*?</details>|!\[.*?]\(.*?\)",
     re.S | re.I,
 )
+
+
+@dataclass(frozen=True)
+class _OpenWebUIFileAttachment:
+    """Resolved Open WebUI file attachment (local filesystem path + metadata)."""
+
+    id: str
+    filename: str
+    local_path: str
+    size_bytes: int
+    content_type: str
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Data Models
