@@ -4,7 +4,7 @@ id: anthropic_manifold
 author: Based on original by justinh-rahb, christian-taillon, Mark Kazakov, Vincent, NIK-NUB, Snav
 description: Full-featured Anthropic Claude API integration with extended thinking, web search, tool calling, and more.
 required_open_webui_version: 0.6.10
-version: 1.2.0
+version: 1.2.1
 license: MIT
 """
 
@@ -671,7 +671,7 @@ class Pipe:
         payload = {
             "model": model,
             "messages": messages,
-            "max_tokens": body.get("max_tokens", 4096),
+            "max_tokens": body.get("max_tokens", 64000),
             "stream": body.get("stream", True),
         }
 
@@ -758,7 +758,7 @@ class Pipe:
         """Get thinking budget based on effort level or valve."""
         if valves.EFFORT_LEVEL != "not_set":
             return EFFORT_TO_BUDGET.get(valves.EFFORT_LEVEL, 16000)
-        return max(1024, min(32000, valves.THINKING_BUDGET))
+        return max(1024, min(63999, valves.THINKING_BUDGET))
 
     # ─────────────────────────────────────────────────────────────────────────
     # 4.8 Web Search
@@ -906,6 +906,97 @@ class Pipe:
             current_thinking_content = ""
             current_thinking_signature = ""
 
+            # Buffer streamed output to reduce tiny SSE chunks and avoid splitting HTML tags.
+            stream_buffer = ""
+
+            OUTPUT_CHUNK_TARGET = 96
+            OUTPUT_CHUNK_MAX = 32768
+            CODE_FENCE_RE = re.compile(r"(?m)^[ \t]*```")
+
+            def _has_unclosed_html_tag(text: str) -> bool:
+                last_lt = text.rfind("<")
+                if last_lt == -1:
+                    return False
+                last_gt = text.rfind(">")
+                return last_gt < last_lt
+
+            def _ends_inside_code_fence(text: str) -> bool:
+                return len(CODE_FENCE_RE.findall(text)) % 2 == 1
+
+            def _tail_outside_code_fences(text: str) -> str:
+                if _ends_inside_code_fence(text):
+                    return ""
+                last_fence = None
+                for match in CODE_FENCE_RE.finditer(text):
+                    last_fence = match
+                if not last_fence:
+                    return text
+                fence_line_end = text.find("\n", last_fence.start())
+                if fence_line_end == -1:
+                    return ""
+                return text[fence_line_end + 1 :]
+
+            def _pop_flushable_chunk(*, force: bool = False) -> str | None:
+                nonlocal stream_buffer
+                if not stream_buffer:
+                    return None
+
+                if force:
+                    chunk = stream_buffer
+                    stream_buffer = ""
+                    return chunk
+
+                if len(stream_buffer) < OUTPUT_CHUNK_TARGET and "\n" not in stream_buffer:
+                    return None
+
+                # Prefer splitting at line boundaries when possible, but never while inside a fenced code block.
+                if "\n" in stream_buffer:
+                    for idx in range(len(stream_buffer) - 1, -1, -1):
+                        if stream_buffer[idx] != "\n":
+                            continue
+                        candidate_end = idx + 1
+                        candidate = stream_buffer[:candidate_end]
+                        if _ends_inside_code_fence(candidate):
+                            continue
+                        if _has_unclosed_html_tag(_tail_outside_code_fences(candidate)):
+                            continue
+                        chunk = candidate
+                        stream_buffer = stream_buffer[candidate_end:]
+                        return chunk
+
+                if stream_buffer.endswith("`"):
+                    return None
+
+                if _ends_inside_code_fence(stream_buffer):
+                    return None
+
+                if _has_unclosed_html_tag(_tail_outside_code_fences(stream_buffer)):
+                    return None
+
+                if (
+                    len(stream_buffer) >= OUTPUT_CHUNK_MAX
+                    or stream_buffer[-1].isspace()
+                    or stream_buffer[-1] in ".!?,;:"
+                ):
+                    chunk = stream_buffer
+                    stream_buffer = ""
+                    return chunk
+
+                return None
+
+            def _append_to_stream(text: str) -> List[str]:
+                nonlocal stream_buffer
+                if not text:
+                    return []
+                stream_buffer += text
+                chunks: list[str] = []
+                while True:
+                    chunk = _pop_flushable_chunk()
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                return chunks
+
             try:
                 async with session.post(
                     ANTHROPIC_API_URL,
@@ -945,6 +1036,9 @@ class Pipe:
                                 if valves.DISPLAY_THINKING and not in_thinking:
                                     in_thinking = True
                                     has_yielded_think_close = False  # Reset for interleaved thinking
+                                    # Flush any pending output before opening a reasoning tag.
+                                    while (chunk := _pop_flushable_chunk(force=True)):
+                                        yield chunk
                                     yield "<think>"
 
                             elif block_type == "text":
@@ -958,6 +1052,8 @@ class Pipe:
                                     current_thinking_content = ""
 
                                 if in_thinking and not has_yielded_think_close:
+                                    while (chunk := _pop_flushable_chunk(force=True)):
+                                        yield chunk
                                     yield "</think>"
                                     has_yielded_think_close = True
                                     in_thinking = False
@@ -965,7 +1061,8 @@ class Pipe:
                                 # Yield initial text if any
                                 if block.get("text"):
                                     accumulated_text += block["text"]
-                                    yield block["text"]
+                                    for chunk in _append_to_stream(block["text"]):
+                                        yield chunk
 
                             elif block_type == "tool_use":
                                 # Save completed thinking block before transitioning
@@ -978,6 +1075,8 @@ class Pipe:
                                     current_thinking_content = ""
 
                                 if in_thinking and not has_yielded_think_close:
+                                    while (chunk := _pop_flushable_chunk(force=True)):
+                                        yield chunk
                                     yield "</think>"
                                     has_yielded_think_close = True
                                     in_thinking = False
@@ -1007,6 +1106,8 @@ class Pipe:
 
                                 # Close thinking before tool execution output
                                 if in_thinking and not has_yielded_think_close:
+                                    while (chunk := _pop_flushable_chunk(force=True)):
+                                        yield chunk
                                     yield "</think>"
                                     has_yielded_think_close = True
                                     in_thinking = False
@@ -1045,9 +1146,12 @@ class Pipe:
                             elif block_type == "redacted_thinking":
                                 if valves.DISPLAY_THINKING:
                                     if not in_thinking:
+                                        while (chunk := _pop_flushable_chunk(force=True)):
+                                            yield chunk
                                         yield "<think>"
                                         in_thinking = True
-                                    yield "[Redacted thinking content]"
+                                    for chunk in _append_to_stream("[Redacted thinking content]"):
+                                        yield chunk
 
                             elif block_type == "web_search_tool_result":
                                 await self._handle_web_search_results(block, event_emitter)
@@ -1055,6 +1159,8 @@ class Pipe:
                             elif block_type == "bash_code_execution_tool_result":
                                 # Close thinking before output
                                 if in_thinking and not has_yielded_think_close:
+                                    while (chunk := _pop_flushable_chunk(force=True)):
+                                        yield chunk
                                     yield "</think>"
                                     has_yielded_think_close = True
                                     in_thinking = False
@@ -1067,21 +1173,27 @@ class Pipe:
                                 if stdout:
                                     output_text = f"\n```output\n{stdout}\n```\n"
                                     accumulated_text += output_text
+                                    while (chunk := _pop_flushable_chunk(force=True)):
+                                        yield chunk
                                     yield output_text
                                 if stderr:
                                     stderr_text = f"\n```stderr\n{stderr}\n```\n"
                                     accumulated_text += stderr_text
+                                    while (chunk := _pop_flushable_chunk(force=True)):
+                                        yield chunk
                                     yield stderr_text
 
                                 await self._emit_status(
                                     event_emitter,
                                     f"Code executed (exit: {return_code})",
-                                    done=False,
+                                    done=True,
                                 )
 
                             elif block_type == "text_editor_code_execution_tool_result":
                                 # Close thinking before output
                                 if in_thinking and not has_yielded_think_close:
+                                    while (chunk := _pop_flushable_chunk(force=True)):
+                                        yield chunk
                                     yield "</think>"
                                     has_yielded_think_close = True
                                     in_thinking = False
@@ -1093,7 +1205,15 @@ class Pipe:
                                 if file_content:
                                     content_text = f"\n```{file_type}\n{file_content}\n```\n"
                                     accumulated_text += content_text
+                                    while (chunk := _pop_flushable_chunk(force=True)):
+                                        yield chunk
                                     yield content_text
+
+                                await self._emit_status(
+                                    event_emitter,
+                                    "File operation complete",
+                                    done=True,
+                                )
 
                         # ─── Content Block Delta ───
                         elif event_type == "content_block_delta":
@@ -1104,12 +1224,14 @@ class Pipe:
                                 thinking_text = delta.get("thinking", "")
                                 current_thinking_content += thinking_text
                                 if valves.DISPLAY_THINKING and in_thinking:
-                                    yield thinking_text
+                                    for chunk in _append_to_stream(thinking_text):
+                                        yield chunk
 
                             elif delta_type == "text_delta":
                                 text = delta.get("text", "")
                                 accumulated_text += text
-                                yield text
+                                for chunk in _append_to_stream(text):
+                                    yield chunk
 
                             elif delta_type == "input_json_delta":
                                 partial = delta.get("partial_json", "")
@@ -1149,6 +1271,8 @@ class Pipe:
                                         lang = "python" if command.strip().startswith("python") else "bash"
                                         code_block = f"\n```{lang}\n{command}\n```\n"
                                         accumulated_text += code_block
+                                        while (chunk := _pop_flushable_chunk(force=True)):
+                                            yield chunk
                                         yield code_block
 
                                 elif tool_name == "text_editor_code_execution":
@@ -1160,6 +1284,8 @@ class Pipe:
                                         ext = path.split(".")[-1] if "." in path else "text"
                                         code_block = f"\n**Creating `{path}`:**\n```{ext}\n{content}\n```\n"
                                         accumulated_text += code_block
+                                        while (chunk := _pop_flushable_chunk(force=True)):
+                                            yield chunk
                                         yield code_block
                                     elif cmd == "str_replace":
                                         old_str = tool_input.get("old_str", "")
@@ -1167,10 +1293,14 @@ class Pipe:
                                         if old_str or new_str:
                                             edit_block = f"\n**Editing `{path}`:**\n```diff\n- {old_str}\n+ {new_str}\n```\n"
                                             accumulated_text += edit_block
+                                            while (chunk := _pop_flushable_chunk(force=True)):
+                                                yield chunk
                                             yield edit_block
                                     elif cmd == "view":
                                         view_msg = f"\n**Viewing `{path}`**\n"
                                         accumulated_text += view_msg
+                                        while (chunk := _pop_flushable_chunk(force=True)):
+                                            yield chunk
                                         yield view_msg
 
                             if current_tool_call:
@@ -1185,6 +1315,8 @@ class Pipe:
                                 current_tool_input_json = ""
 
                             if in_thinking and not has_yielded_think_close:
+                                while (chunk := _pop_flushable_chunk(force=True)):
+                                    yield chunk
                                 yield "</think>"
                                 has_yielded_think_close = True
                                 in_thinking = False
@@ -1192,7 +1324,11 @@ class Pipe:
                         # ─── Message Stop ───
                         elif event_type == "message_stop":
                             if in_thinking and not has_yielded_think_close:
+                                while (chunk := _pop_flushable_chunk(force=True)):
+                                    yield chunk
                                 yield "</think>"
+                            while (chunk := _pop_flushable_chunk(force=True)):
+                                yield chunk
                             break
 
                         # ─── Message Delta (usage, stop reason) ───
@@ -1200,7 +1336,11 @@ class Pipe:
                             stop_reason = data.get("delta", {}).get("stop_reason")
                             if stop_reason == "end_turn":
                                 if in_thinking and not has_yielded_think_close:
+                                    while (chunk := _pop_flushable_chunk(force=True)):
+                                        yield chunk
                                     yield "</think>"
+                                while (chunk := _pop_flushable_chunk(force=True)):
+                                    yield chunk
                                 break
 
             except aiohttp.ClientError as e:
@@ -1212,7 +1352,6 @@ class Pipe:
             # ─── Handle Tool Calls ───
             if not tool_calls:
                 # No tool calls, we're done
-                await self._emit_status(event_emitter, "", done=True)
                 return
 
             # Execute tool calls
@@ -1284,7 +1423,7 @@ class Pipe:
             await self._emit_status(
                 event_emitter,
                 f"Found {source_count} sources",
-                done=False,
+                done=True,
             )
 
     async def _emit_document_citation(
@@ -1373,6 +1512,12 @@ class Pipe:
                 else:
                     result = await asyncio.to_thread(fn, **args)
 
+                await self._emit_status(
+                    event_emitter,
+                    f"Finished {tool_name}",
+                    done=True,
+                )
+
                 return {
                     "type": "tool_result",
                     "tool_use_id": call["id"],
@@ -1381,6 +1526,11 @@ class Pipe:
 
             except Exception as e:
                 self.logger.error("Tool %s error: %s", tool_name, e)
+                await self._emit_status(
+                    event_emitter,
+                    f"Error running {tool_name}",
+                    done=True,
+                )
                 return {
                     "type": "tool_result",
                     "tool_use_id": call["id"],
@@ -1479,6 +1629,18 @@ class Pipe:
                     "error": {"message": error_message},
                     "done": True,
                 },
+            })
+
+    async def _emit_message_delta(
+        self,
+        event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None,
+        content: str,
+    ) -> None:
+        """Emit message content atomically (avoids SSE chunking issues)."""
+        if event_emitter:
+            await event_emitter({
+                "type": "message",
+                "data": {"content": content},
             })
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1705,17 +1867,25 @@ class Pipe:
                 log.warning(f"Could not fetch chat: {chat_id}")
                 return []
 
-            messages_db = chat.chat.get("messages", [])[:-1]  # Exclude pending assistant msg
+            messages_db: list[dict[str, Any]] = []
+            chat_data = chat.chat
+            history_messages = chat_data.get("history", {}).get("messages")
+            if isinstance(history_messages, dict):
+                messages_db = list(history_messages.values())
+            elif isinstance(history_messages, list):
+                messages_db = history_messages
+            else:
+                maybe_messages = chat_data.get("messages", [])
+                if isinstance(maybe_messages, list):
+                    messages_db = maybe_messages
 
-            # Collect all file IDs from user messages
             file_ids_seen: set[str] = set()
             for msg in messages_db:
-                if msg.get("role") == "user":
-                    for file_ref in msg.get("files", []):
-                        file_id = file_ref.get("id") or file_ref.get("file", {}).get("id")
-                        if file_id and file_id not in file_ids_seen:
-                            file_ids_seen.add(file_id)
-
+                for file_ref in msg.get("files", []):
+                    fid = file_ref.get("id") or file_ref.get("file", {}).get("id")
+                    if not fid:
+                        continue
+                    file_ids_seen.add(fid)
             if not file_ids_seen:
                 log.debug("No files found in chat history")
                 return []
@@ -1730,7 +1900,7 @@ class Pipe:
                     await self._emit_status(
                         event_emitter,
                         f"Failed to read file: {filename or file_id}",
-                        done=False,
+                        done=True,
                     )
                     continue
 
@@ -1751,11 +1921,16 @@ class Pipe:
                         "filename": filename,
                         "mime_type": mime_type,
                     })
+                    await self._emit_status(
+                        event_emitter,
+                        f"Uploaded {filename}",
+                        done=True,
+                    )
                 else:
                     await self._emit_status(
                         event_emitter,
                         f"Failed to upload: {filename}",
-                        done=False,
+                        done=True,
                     )
 
             return uploaded_files

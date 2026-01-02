@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.1] - 2026-01-02
+
+### Fixed
+
+- **Streaming Stability** - Reduced HTML/markdown breakage by buffering streamed deltas and avoiding mixed `yield` + `message` event emission.
+- **Status Lifecycle** - Tool status updates now mark completion (`done=True`) so progress indicators clear correctly.
+
 ## [1.2.0] - 2025-01-01
 
 ### Fixed

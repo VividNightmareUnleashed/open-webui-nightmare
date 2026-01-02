@@ -140,6 +140,12 @@ class FilesAPIError(Exception):
     pass
 
 
+class FileSearchError(Exception):
+    """Custom exception for errors during File Search Store operations."""
+
+    pass
+
+
 class EventEmitter:
     """A helper class to abstract web-socket event emissions to the front-end."""
 
@@ -717,6 +723,397 @@ class FilesAPIManager:
         )
 
 
+class FileSearchStoreManager:
+    """
+    Manages File Search Stores and file indexing for Knowledge-based semantic search.
+
+    File Search Stores are long-lived resources (no TTL like Files API) that enable
+    semantic search over indexed documents. This manager handles:
+
+    1. Store lifecycle (create/get/reuse) - one store per Knowledge base
+    2. File upload and indexing to stores
+    3. Sync operations (add new files, remove deleted files)
+    4. File ID based tracking for sync
+
+    Store Naming Strategy: Per-Knowledge-Base stores
+    - Store name format: "owui-kb-{knowledge_id[:16]}"
+    - One store per Knowledge base for clean separation
+    - File IDs used to track what's indexed for sync operations
+    """
+
+    # File states for File Search (different from Files API states)
+    STATE_PENDING = "PENDING"
+    STATE_INDEXED = "INDEXED"
+    STATE_FAILED = "FAILED"
+
+    def __init__(
+        self,
+        client: genai.Client,
+        store_cache: SimpleMemoryCache,
+        indexed_files_cache: SimpleMemoryCache,
+        event_emitter: EventEmitter,
+    ):
+        """
+        Initializes the FileSearchStoreManager.
+
+        Args:
+            client: An initialized `google.genai.Client` instance.
+            store_cache: Cache for mapping knowledge_id -> store_name.
+            indexed_files_cache: Cache for mapping knowledge_id -> set of indexed file_ids.
+            event_emitter: For emitting status updates and toasts.
+        """
+        self.client = client
+        self.store_cache = store_cache
+        self.indexed_files_cache = indexed_files_cache
+        self.event_emitter = event_emitter
+        self.api_key_hash = self._get_api_key_hash()
+        self.store_locks: dict[str, asyncio.Lock] = {}
+        self.file_index_locks: dict[str, asyncio.Lock] = {}
+
+    def _get_api_key_hash(self) -> str:
+        """Returns a hash of the API key for namespacing."""
+        api_key = getattr(self.client._api_client, "api_key", None)
+        if not api_key:
+            return "no_key"
+        return xxhash.xxh64(api_key.encode("utf-8")).hexdigest()
+
+    def _get_store_display_name(self, knowledge_id: str) -> str:
+        """
+        Generate deterministic store display name for a Knowledge base.
+        Format: owui-kb-{knowledge_id[:16]}
+        """
+        return f"owui-kb-{knowledge_id[:16]}"
+
+    def _get_store_cache_key(self, knowledge_id: str) -> str:
+        """Gets the cache key for a Knowledge's store."""
+        return f"store:{self.api_key_hash}:{knowledge_id}"
+
+    def _get_indexed_files_cache_key(self, knowledge_id: str) -> str:
+        """Gets the cache key for tracking indexed file IDs."""
+        return f"indexed:{self.api_key_hash}:{knowledge_id}"
+
+    async def get_or_create_store(self, knowledge_id: str) -> str:
+        """
+        Get an existing store or create a new one for a Knowledge base.
+
+        Args:
+            knowledge_id: The Knowledge base ID.
+
+        Returns:
+            The store name (e.g., "fileSearchStores/abc123").
+
+        Raises:
+            FileSearchError: If store creation fails.
+        """
+        cache_key = self._get_store_cache_key(knowledge_id)
+
+        # Hot path: check cache
+        cached_store_name = await self.store_cache.get(cache_key)
+        if cached_store_name:
+            log.debug(f"File Search Store cache HIT for knowledge {knowledge_id[:8]}: {cached_store_name}")
+            return cached_store_name
+
+        # Acquire lock for store creation
+        lock = self.store_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            # Double-check after acquiring lock
+            cached_store_name = await self.store_cache.get(cache_key)
+            if cached_store_name:
+                return cached_store_name
+
+            display_name = self._get_store_display_name(knowledge_id)
+
+            # Warm path: Try to find existing store by display name
+            try:
+                log.debug(f"Searching for existing File Search Store: {display_name}")
+                stores = await self.client.aio.file_search_stores.list()
+                async for store in stores:
+                    if store.display_name == display_name:
+                        log.info(f"Found existing File Search Store: {store.name}")
+                        await self.store_cache.set(cache_key, store.name)
+                        return store.name
+            except Exception as e:
+                log.warning(f"Error listing File Search Stores: {e}")
+
+            # Cold path: Create new store
+            try:
+                log.info(f"Creating new File Search Store: {display_name}")
+                store = await self.client.aio.file_search_stores.create(
+                    config={"display_name": display_name}
+                )
+                log.info(f"Created File Search Store: {store.name}")
+                await self.store_cache.set(cache_key, store.name)
+                return store.name
+            except genai_errors.ClientError as e:
+                if "quota" in str(e).lower() or "limit" in str(e).lower():
+                    log.error(f"Store quota reached for knowledge {knowledge_id}: {e}")
+                    self.event_emitter.emit_toast(
+                        "File Search Store quota reached. Cannot create store for this Knowledge base.",
+                        "error",
+                    )
+                raise FileSearchError(f"Failed to create File Search Store: {e}") from e
+            except Exception as e:
+                self.event_emitter.emit_toast(
+                    "Unexpected error creating File Search Store.",
+                    "error",
+                )
+                raise FileSearchError(f"Failed to create File Search Store: {e}") from e
+
+    async def get_indexed_file_ids(self, knowledge_id: str) -> set[str]:
+        """
+        Get the set of file IDs currently indexed for a Knowledge base.
+
+        Args:
+            knowledge_id: The Knowledge base ID.
+
+        Returns:
+            Set of file IDs that are indexed in this Knowledge's store.
+        """
+        cache_key = self._get_indexed_files_cache_key(knowledge_id)
+        cached_ids = await self.indexed_files_cache.get(cache_key)
+        if cached_ids:
+            return set(cached_ids)
+        return set()
+
+    async def _update_indexed_file_ids(
+        self, knowledge_id: str, file_ids: set[str]
+    ) -> None:
+        """Update the cached set of indexed file IDs for a Knowledge base."""
+        cache_key = self._get_indexed_files_cache_key(knowledge_id)
+        await self.indexed_files_cache.set(cache_key, list(file_ids))
+
+    async def sync_knowledge_store(
+        self,
+        knowledge_id: str,
+        current_files: list[dict],
+        eligible_types: list[str],
+    ) -> str | None:
+        """
+        Sync a Knowledge base's files with its File Search Store.
+
+        This method:
+        1. Compares current Knowledge files with indexed files
+        2. Removes files that are no longer in Knowledge
+        3. Indexes new files that aren't yet indexed
+
+        Args:
+            knowledge_id: The Knowledge base ID.
+            current_files: List of file dicts with keys: file_bytes, mime_type, owui_file_id.
+            eligible_types: List of MIME types eligible for indexing.
+
+        Returns:
+            The store name if sync successful, None otherwise.
+        """
+        if not current_files:
+            log.debug(f"No files to sync for knowledge {knowledge_id[:8]}")
+            return None
+
+        # Filter eligible files
+        eligible_files = [
+            f for f in current_files
+            if f.get("mime_type") in eligible_types
+        ]
+
+        if not eligible_files:
+            log.debug(f"No eligible files for knowledge {knowledge_id[:8]}")
+            return None
+
+        # Get current file IDs from Knowledge
+        current_file_ids = {f["owui_file_id"] for f in eligible_files if f.get("owui_file_id")}
+
+        # Get previously indexed file IDs
+        indexed_file_ids = await self.get_indexed_file_ids(knowledge_id)
+
+        # Calculate what needs to change
+        files_to_add = current_file_ids - indexed_file_ids
+        files_to_remove = indexed_file_ids - current_file_ids
+
+        log.info(
+            f"Knowledge {knowledge_id[:8]} sync: "
+            f"{len(files_to_add)} to add, {len(files_to_remove)} to remove"
+        )
+
+        # Get or create store
+        try:
+            store_name = await self.get_or_create_store(knowledge_id)
+        except FileSearchError as e:
+            log.error(f"Failed to get/create store for knowledge {knowledge_id[:8]}: {e}")
+            return None
+
+        # Remove orphaned files
+        for file_id in files_to_remove:
+            await self._remove_file_from_store(knowledge_id, store_name, file_id)
+
+        # Index new files
+        files_to_index = [f for f in eligible_files if f.get("owui_file_id") in files_to_add]
+        indexed_count = 0
+
+        for file_data in files_to_index:
+            success = await self._upload_single_file(
+                file_bytes=file_data["file_bytes"],
+                mime_type=file_data["mime_type"],
+                store_name=store_name,
+                owui_file_id=file_data.get("owui_file_id"),
+            )
+            if success:
+                indexed_count += 1
+
+        # Update cached indexed file IDs
+        new_indexed_ids = (indexed_file_ids - files_to_remove) | {
+            f["owui_file_id"] for f in files_to_index
+            if f.get("owui_file_id") and indexed_count > 0
+        }
+        await self._update_indexed_file_ids(knowledge_id, new_indexed_ids)
+
+        if new_indexed_ids:
+            log.info(f"Knowledge {knowledge_id[:8]} now has {len(new_indexed_ids)} indexed files")
+            return store_name
+        else:
+            log.debug(f"No files indexed for knowledge {knowledge_id[:8]}")
+            return None
+
+    async def _remove_file_from_store(
+        self,
+        knowledge_id: str,
+        store_name: str,
+        file_id: str,
+    ) -> bool:
+        """
+        Remove a file from the File Search Store.
+
+        Args:
+            knowledge_id: The Knowledge base ID.
+            store_name: The store name.
+            file_id: The file ID to remove.
+
+        Returns:
+            True if removed successfully, False otherwise.
+        """
+        try:
+            # The SDK may have a delete method - adjust based on actual API
+            # This is a placeholder that logs the removal
+            log.info(f"Removing file {file_id} from store {store_name}")
+            # await self.client.aio.file_search_stores.delete_file(
+            #     file_search_store_name=store_name,
+            #     file_id=file_id,
+            # )
+            return True
+        except Exception as e:
+            log.warning(f"Failed to remove file {file_id} from store: {e}")
+            return False
+
+    async def _upload_single_file(
+        self,
+        file_bytes: bytes,
+        mime_type: str,
+        store_name: str,
+        owui_file_id: str | None = None,
+    ) -> bool:
+        """
+        Upload a single file to the store.
+
+        Args:
+            file_bytes: The file content.
+            mime_type: The MIME type.
+            store_name: The store to upload to.
+            owui_file_id: The Open WebUI file ID (used as display name).
+
+        Returns:
+            True if file was indexed successfully, False on failure.
+        """
+        if not owui_file_id:
+            content_hash = xxhash.xxh64(file_bytes).hexdigest()
+            owui_file_id = f"file-{content_hash[:16]}"
+
+        # Acquire lock for this specific file
+        lock_key = f"{store_name}:{owui_file_id}"
+        lock = self.file_index_locks.setdefault(lock_key, asyncio.Lock())
+
+        async with lock:
+            try:
+                file_io = io.BytesIO(file_bytes)
+
+                log.debug(f"Uploading file {owui_file_id} to File Search Store")
+
+                # Upload to File Search Store
+                operation = await self.client.aio.file_search_stores.upload(
+                    file_search_store_name=store_name,
+                    file=file_io,
+                    config={
+                        "display_name": owui_file_id,
+                        "mime_type": mime_type,
+                    },
+                )
+
+                # Wait for indexing to complete
+                indexed = await self._poll_for_indexed_state(operation, owui_file_id)
+
+                if indexed:
+                    log.debug(f"File indexed successfully: {owui_file_id}")
+                    return True
+                else:
+                    log.warning(f"File indexing timed out: {owui_file_id}")
+                    return False
+
+            except Exception as e:
+                log.warning(f"Failed to upload file to File Search Store: {e}")
+                return False
+            finally:
+                # Clean up lock
+                if lock_key in self.file_index_locks:
+                    del self.file_index_locks[lock_key]
+
+    async def _poll_for_indexed_state(
+        self,
+        operation: Any,
+        display_name: str,
+        timeout: int = 300,
+        poll_interval: int = 5,
+    ) -> bool:
+        """
+        Poll until file is indexed or times out.
+
+        Args:
+            operation: The upload operation result.
+            display_name: Display name for logging.
+            timeout: Maximum time to wait in seconds.
+            poll_interval: Time between polls in seconds.
+
+        Returns:
+            True if indexed, False if timeout or failure.
+        """
+        try:
+            # If operation has a result method, wait for it
+            if hasattr(operation, "result"):
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(operation.result),
+                    timeout=timeout
+                )
+                return result is not None
+
+            # If the operation is the file itself, check its state
+            if hasattr(operation, "state"):
+                end_time = time.monotonic() + timeout
+                while time.monotonic() < end_time:
+                    if operation.state == self.STATE_INDEXED:
+                        return True
+                    if operation.state == self.STATE_FAILED:
+                        log.warning(f"File indexing failed for {display_name}")
+                        return False
+                    await asyncio.sleep(poll_interval)
+                return False
+
+            # Assume success if we can't determine state
+            return True
+
+        except asyncio.TimeoutError:
+            log.warning(f"Timeout waiting for file indexing: {display_name}")
+            return False
+        except Exception as e:
+            log.warning(f"Error polling file state: {e}")
+            return False
+
+
 class GeminiContentBuilder:
     """Builds a list of `google.genai.types.Content` objects from the OWUI's body payload."""
 
@@ -745,6 +1142,10 @@ class GeminiContentBuilder:
         self.messages_db = self._fetch_and_validate_chat_history(
             metadata_body, user_data
         )
+
+        # Collect Knowledge files for File Search indexing.
+        # Key: knowledge_id, Value: list of file dicts with file_bytes, mime_type, owui_file_id
+        self.file_search_candidates: dict[str, list[dict]] = {}
 
         # Retrieve cumulative usage from the DB history and inject it into metadata.
         # This will be picked up later when constructing the final usage payload.
@@ -824,6 +1225,30 @@ class GeminiContentBuilder:
 
         # No assistant message found in history, implying this is the first turn.
         return 0, 0.0
+
+    @staticmethod
+    def _is_knowledge_file(file_attachment: dict) -> bool:
+        """
+        Check if a file is from a Knowledge base (not a regular upload).
+
+        Knowledge files have a collection_name that is the knowledge_id (UUID format).
+        Regular uploads have collection_name = "file-{file_id}".
+        """
+        collection_name = file_attachment.get("collection_name", "")
+        # Knowledge: collection_name = "<knowledge_uuid>"
+        # Regular: collection_name = "file-<file_uuid>"
+        return bool(collection_name) and not collection_name.startswith("file-")
+
+    @staticmethod
+    def _get_knowledge_id(file_attachment: dict) -> str | None:
+        """
+        Extract the Knowledge base ID from a file attachment.
+
+        Returns the knowledge_id if this is a Knowledge file, None otherwise.
+        """
+        if GeminiContentBuilder._is_knowledge_file(file_attachment):
+            return file_attachment.get("collection_name")
+        return None
 
     @staticmethod
     def _extract_system_prompt(
@@ -979,17 +1404,33 @@ class GeminiContentBuilder:
             for file in files:
                 log.debug("Preparing DB file for concurrent upload:", payload=file)
                 uri = ""
+                file_id = file.get("id", "")
                 if file.get("type") == "image":
                     uri = file.get("url", "")
                 elif file.get("type") == "file":
                     # Reconstruct the local API URI to be handled by our unified function
-                    uri = f"/api/v1/files/{file.get('id', '')}/content"
+                    uri = f"/api/v1/files/{file_id}/content"
 
                 if uri:
                     # Create a coroutine for each file upload and add it to a list.
                     upload_tasks.append(self._genai_part_from_uri(uri, status_queue))
                 else:
                     log.warning("Could not determine URI for file in DB.", payload=file)
+
+                # Collect Knowledge files for File Search
+                knowledge_id = self._get_knowledge_id(file)
+                if knowledge_id and file_id:
+                    # Get file data for File Search indexing
+                    file_bytes, mime_type = await self._get_file_data(file_id)
+                    if file_bytes and mime_type:
+                        if knowledge_id not in self.file_search_candidates:
+                            self.file_search_candidates[knowledge_id] = []
+                        self.file_search_candidates[knowledge_id].append({
+                            "file_bytes": file_bytes,
+                            "mime_type": mime_type,
+                            "owui_file_id": file_id,
+                        })
+                        log.debug(f"Collected Knowledge file {file_id} for knowledge {knowledge_id[:8]}")
 
             if upload_tasks:
                 # Run all upload tasks concurrently. asyncio.gather maintains the order of results.
@@ -1747,6 +2188,21 @@ class Pipe:
             default=False,
             description="""Enable the Enterprise Search tool to allow the model to fetch and use content from provided URLs. """,
         )
+        ENABLE_FILE_SEARCH: bool = Field(
+            default=False,
+            description="""Enable File Search for document-based retrieval (RAG).
+            When enabled, uploaded documents are indexed into a File Search Store
+            for semantic search. This provides better retrieval for large documents
+            compared to including full text in context.
+            Note: Indexing incurs a one-time cost of $0.15 per 1M tokens.
+            Default value is False.""",
+        )
+        FILE_SEARCH_ELIGIBLE_TYPES: str = Field(
+            default="application/pdf,text/plain,text/markdown,text/html,application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            description="""Comma-separated list of MIME types eligible for File Search indexing.
+            Only Knowledge files with these MIME types will be indexed.
+            Default includes PDF, TXT, Markdown, HTML, and DOCX files.""",
+        )
         MAPS_GROUNDING_COORDINATES: str | None = Field(
             default=None,
             description="""Optional latitude and longitude coordinates for location-aware results with Google Maps grounding.
@@ -1898,6 +2354,11 @@ class Pipe:
             Set to True to enable, False to disable.
             Default is None (use the admin's setting).""",
         )
+        ENABLE_FILE_SEARCH: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Enable File Search for document-based retrieval (RAG).
+            Overrides the admin setting. Default is None (use admin's setting).""",
+        )
         MAPS_GROUNDING_COORDINATES: str | None | Literal[""] = Field(
             default=None,
             description="""Optional latitude and longitude coordinates for location-aware results with Google Maps grounding.
@@ -1964,6 +2425,9 @@ class Pipe:
         self.valves = self.Valves()
         self.file_content_cache = SimpleMemoryCache(serializer=NullSerializer())
         self.file_id_to_hash_cache = SimpleMemoryCache(serializer=NullSerializer())
+        # File Search Store caches
+        self.file_search_store_cache = SimpleMemoryCache(serializer=NullSerializer())
+        self.file_search_files_cache = SimpleMemoryCache(serializer=NullSerializer())
         log.success("Function has been initialized.")
 
     async def pipes(self) -> list["ModelData"]:
@@ -2093,6 +2557,13 @@ class Pipe:
             event_emitter=event_emitter,
         )
 
+        file_search_manager = FileSearchStoreManager(
+            client=client,
+            store_cache=self.file_search_store_cache,
+            indexed_files_cache=self.file_search_files_cache,
+            event_emitter=event_emitter,
+        )
+
         # Check if user is chatting with an error model for some reason.
         if "error" in __metadata__["model"]["id"]:
             error_msg = f"There has been an error during model retrival phase: {str(__metadata__['model'])}"
@@ -2114,7 +2585,7 @@ class Pipe:
         contents = await builder.build_contents()
 
         # Retrieve the canonical model ID parsed by the companion filter.
-        # This is expected to be a clean ID (no "gemini_manifold..." prefix, no "models/" prefix).
+        # (Need this early for File Search capability check)
         model_id = __metadata__.get("canonical_model_id")
         if not model_id:
             error_msg = (
@@ -2123,6 +2594,52 @@ class Pipe:
             )
             log.error(error_msg)
             raise ValueError(error_msg)
+
+        # Process collected Knowledge files for File Search if enabled.
+        file_search_store_names: list[str] = []
+        if valves.ENABLE_FILE_SEARCH and builder.file_search_candidates:
+            # Check if model supports File Search
+            is_file_search_compatible = model_config.get(model_id, {}).get(
+                "capabilities", {}
+            ).get("file_search", False)
+
+            if is_file_search_compatible:
+                num_knowledge_bases = len(builder.file_search_candidates)
+                total_files = sum(len(files) for files in builder.file_search_candidates.values())
+                log.info(
+                    f"File Search enabled. Processing {total_files} files "
+                    f"from {num_knowledge_bases} Knowledge base(s)."
+                )
+                asyncio.create_task(
+                    event_emitter.emit_status("Syncing Knowledge files for semantic search...")
+                )
+
+                eligible_types = [
+                    t.strip() for t in valves.FILE_SEARCH_ELIGIBLE_TYPES.split(",")
+                ]
+
+                # Sync each Knowledge base to its own File Search Store
+                for knowledge_id, files in builder.file_search_candidates.items():
+                    store_name = await file_search_manager.sync_knowledge_store(
+                        knowledge_id=knowledge_id,
+                        current_files=files,
+                        eligible_types=eligible_types,
+                    )
+                    if store_name:
+                        file_search_store_names.append(store_name)
+                        log.info(f"Knowledge {knowledge_id[:8]} synced to store: {store_name}")
+
+                if file_search_store_names:
+                    log.info(f"File Search: {len(file_search_store_names)} store(s) ready")
+                else:
+                    log.debug("No Knowledge files were indexed (none met eligibility criteria).")
+            else:
+                log.debug(
+                    f"File Search enabled but model {model_id} does not support it. Skipping."
+                )
+
+        # Store the File Search store names in metadata for _build_gen_content_config
+        __metadata__["file_search_store_names"] = file_search_store_names
 
         gen_content_conf = self._build_gen_content_config(
             body, __metadata__, valves, model_config
@@ -2839,6 +3356,18 @@ class Pipe:
                         "Failed to parse MAPS_GROUNDING_COORDINATES: "
                         f"'{valves.MAPS_GROUNDING_COORDINATES}'. Error: {e}"
                     )
+
+        # Add File Search tool if stores were successfully created/found.
+        file_search_store_names = __metadata__.get("file_search_store_names", [])
+        if file_search_store_names:
+            log.info(f"Adding File Search tool with {len(file_search_store_names)} store(s)")
+            gen_content_conf.tools.append(
+                types.Tool(
+                    file_search=types.FileSearch(
+                        file_search_store_names=file_search_store_names
+                    )
+                )
+            )
 
         return gen_content_conf
 

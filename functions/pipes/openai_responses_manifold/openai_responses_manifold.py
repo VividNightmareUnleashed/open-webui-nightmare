@@ -24,6 +24,7 @@ import datetime
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import re
 import sys
@@ -31,6 +32,7 @@ import secrets
 import time
 from collections import defaultdict, deque
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Literal, Optional, Union
 from urllib.parse import urlparse
 
@@ -41,7 +43,9 @@ from pydantic import BaseModel, Field, model_validator
 
 # Open WebUI internals
 from open_webui.models.chats import Chats
+from open_webui.models.files import Files
 from open_webui.models.models import ModelForm, Models
+from open_webui.storage.provider import Storage
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Constants & Global Configuration
@@ -51,6 +55,8 @@ FEATURE_SUPPORT = {
     "web_search_tool": {"gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "o3", "o3-pro", "o4-mini", "o3-deep-research", "o4-mini-deep-research"}, # OpenAI's built-in web search tool.
     "image_gen_tool": {"gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "gpt-4.1-nano", "o3"}, # OpenAI's built-in image generation tool.
     "function_calling": {"gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "gpt-4.1-nano", "o3", "o4-mini", "o3-mini", "o3-pro", "o3-deep-research", "o4-mini-deep-research"}, # OpenAI's native function calling support.
+    "file_search_tool": {"gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "gpt-4.1-nano", "o3", "o4-mini", "o3-mini", "o3-pro"}, # OpenAI's built-in file search tool.
+    "code_interpreter_tool": {"gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "gpt-4.1-nano", "o3", "o4-mini", "o3-mini", "o3-pro"}, # OpenAI's built-in code interpreter tool.
     "reasoning": {"gpt-5", "gpt-5-mini", "gpt-5-nano", "o3", "o4-mini", "o3-mini","o3-pro", "o3-deep-research", "o4-mini-deep-research"}, # OpenAI's reasoning models.
     "reasoning_summary": {"gpt-5", "gpt-5-mini", "gpt-5-nano", "o3", "o4-mini", "o4-mini-high", "o3-mini", "o3-mini-high", "o3-pro", "o3-deep-research", "o4-mini-deep-research"}, # OpenAI's reasoning summary feature.  May require OpenAI org verification before use.
     "verbosity": {"gpt-5", "gpt-5-mini", "gpt-5-nano"}, # Supports OpenAI's verbosity parameter.
@@ -141,6 +147,7 @@ class ResponsesBody(BaseModel):
     user: Optional[str] = None                # user ID for the request.  Recommended to improve caching hits.
     tool_choice: Optional[Dict[str, Any]] = None
     tools: Optional[List[Dict[str, Any]]] = None
+    tool_resources: Optional[Dict[str, Any]] = None
     include: Optional[List[str]] = None           # extra output keys
 
     class Config:
@@ -549,6 +556,61 @@ class Pipe:
             description='User location for web search context. Leave blank to disable. Must be in valid JSON format according to OpenAI spec.  E.g., {"type": "approximate","country": "US","city": "San Francisco","region": "CA"}.',
         )
 
+        # 7) Code Interpreter & File Search
+        ALLOW_OPENAI_FILE_UPLOADS: bool = Field(
+            default=False,
+            description=(
+                "Allow uploading Open WebUI attached files to OpenAI. Required for enabling OpenAI's "
+                "native `file_search` tool and for making attached files available to `code_interpreter`. "
+                "WARNING: enabling this sends file contents to your OpenAI (or custom BASE_URL) endpoint."
+            ),
+        )
+        ENABLE_CODE_INTERPRETER_TOOL: bool = Field(
+            default=False,
+            description=(
+                "Enable OpenAI's built-in `code_interpreter` tool when supported. If files are attached "
+                "and ALLOW_OPENAI_FILE_UPLOADS is enabled, they will be uploaded and made available to the interpreter."
+            ),
+        )
+        ENABLE_FILE_SEARCH_TOOL: bool = Field(
+            default=False,
+            description=(
+                "Enable OpenAI's built-in `file_search` tool when supported. Requires ALLOW_OPENAI_FILE_UPLOADS "
+                "and at least one attached file. The manifold will upload and index files into an OpenAI vector store."
+            ),
+        )
+        FILE_UPLOAD_PURPOSE: str = Field(
+            default="assistants",
+            description="OpenAI file upload `purpose` parameter. Typically `assistants`.",
+        )
+        FILE_UPLOAD_MAX_MB: int = Field(
+            default=25,
+            description="Maximum size (MB) per file to upload to OpenAI. Larger files are skipped.",
+        )
+        VECTOR_STORE_NAME: str = Field(
+            default="Open WebUI File Search",
+            description="Name to use when creating an OpenAI vector store for `file_search`.",
+        )
+        VECTOR_STORE_EXPIRES_AFTER_DAYS: Optional[int] = Field(
+            default=7,
+            description=(
+                "If set, creates vector stores with `expires_after={anchor: last_active_at, days: N}` "
+                "to reduce long-lived resource buildup. Set to null to disable expiration."
+            ),
+        )
+        VECTOR_STORE_REUSE_PER_CHAT: bool = Field(
+            default=True,
+            description="Reuse one OpenAI vector store per Open WebUI chat and add new uploads over time.",
+        )
+        VECTOR_STORE_TIMEOUT_S: int = Field(
+            default=120,
+            description="Maximum seconds to wait for OpenAI file indexing to complete before proceeding.",
+        )
+        VECTOR_STORE_POLL_INTERVAL_S: float = Field(
+            default=1.0,
+            description="Polling interval (seconds) while waiting for vector store indexing.",
+        )
+
         # 7) Persistence
         PERSIST_TOOL_RESULTS: bool = Field(
             default=True,
@@ -662,7 +724,6 @@ class Pipe:
             # Additional optional parameters passed directly to ResponsesBody without validation. Overrides any parameters in the original body with the same name.
             truncation=valves.TRUNCATION,
             user=user_identifier,
-            service_tier=valves.SERVICE_TIER,
             **({"max_tool_calls": valves.MAX_TOOL_CALLS} if valves.MAX_TOOL_CALLS is not None else {}),
         )
 

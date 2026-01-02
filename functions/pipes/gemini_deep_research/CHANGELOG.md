@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.2] - 2026-01-02
+
+### Added
+- `DEADLINE_RETRIES` valve (default: 2) for automatic retries on Google deadline timeouts
+- Improved error message for deadline failures with actionable guidance
+
+### Fixed
+- Complex queries that timeout now retry automatically instead of failing immediately
+
 ## [0.3.1] - 2026-01-01
 
 ### Fixed

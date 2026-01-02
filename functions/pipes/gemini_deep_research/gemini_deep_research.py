@@ -6,7 +6,7 @@ author: openwebuidev
 author_url: https://github.com/openwebuidev
 license: MIT
 required_open_webui_version: 0.6.10
-version: 0.3.1
+version: 0.3.2
 requirements: aiohttp
 """
 
@@ -74,6 +74,10 @@ class Pipe:
             default="INFO",
             description="Logging verbosity level.",
         )
+        DEADLINE_RETRIES: int = Field(
+            default=2,
+            description="Number of retries when Google's deadline expires (0 to disable).",
+        )
 
     def __init__(self) -> None:
         self.valves = self.Valves()
@@ -136,52 +140,90 @@ class Pipe:
         # Emit initial status
         await self._emit_status(__event_emitter__, "Initializing Deep Research...", done=False)
 
-        # Run research
+        # Run research with retry logic for deadline errors
         interaction_id = None
-        try:
-            if self.valves.USE_STREAMING:
-                # Try SSE streaming first
-                async for chunk in self._run_research_streaming(
-                    query=query,
-                    api_key=api_key,
-                    event_emitter=__event_emitter__,
-                    previous_interaction_id=previous_interaction_id,
-                ):
-                    if chunk.startswith("__INTERACTION_ID__:"):
-                        interaction_id = chunk.split(":", 1)[1]
-                    else:
-                        yield chunk
+        max_attempts = self.valves.DEADLINE_RETRIES + 1
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if self.valves.USE_STREAMING:
+                    # Try SSE streaming first
+                    async for chunk in self._run_research_streaming(
+                        query=query,
+                        api_key=api_key,
+                        event_emitter=__event_emitter__,
+                        previous_interaction_id=previous_interaction_id,
+                    ):
+                        if chunk.startswith("__INTERACTION_ID__:"):
+                            interaction_id = chunk.split(":", 1)[1]
+                        else:
+                            yield chunk
+                else:
+                    # Use polling mode
+                    async for chunk in self._run_research_polling(
+                        query=query,
+                        api_key=api_key,
+                        event_emitter=__event_emitter__,
+                        previous_interaction_id=previous_interaction_id,
+                    ):
+                        if chunk.startswith("__INTERACTION_ID__:"):
+                            interaction_id = chunk.split(":", 1)[1]
+                        else:
+                            yield chunk
+
+                # Store interaction_id for follow-ups via metadata
+                if interaction_id and __metadata__:
+                    features = __metadata__.setdefault("features", {})
+                    deep_research = features.setdefault("gemini_deep_research", {})
+                    deep_research["last_interaction_id"] = interaction_id
+
+                # Emit completion status and notification
+                await self._emit_status(__event_emitter__, "Research complete", done=True)
+                await self._emit_notification(__event_emitter__, "Deep Research complete", level="success")
+                return  # Success - exit the retry loop
+
+            except asyncio.CancelledError:
+                log.info("Research cancelled by user")
+                await self._emit_status(__event_emitter__, "Research cancelled", done=True)
+                raise
+
+            except Exception as e:
+                last_error = e
+                error_str = str(e)
+
+                # Check if this is a deadline error and we can retry
+                if self._is_deadline_error(error_str) and attempt < max_attempts:
+                    log.warning(f"Deadline expired (attempt {attempt}/{max_attempts}), retrying...")
+                    await self._emit_status(
+                        __event_emitter__,
+                        f"Google timed out, retrying... (attempt {attempt + 1}/{max_attempts})",
+                        done=False,
+                    )
+                    continue  # Retry
+
+                # Non-deadline error or retries exhausted
+                break
+
+        # Handle final failure
+        if last_error:
+            error_str = str(last_error)
+            log.exception(f"Deep Research failed: {last_error}")
+
+            if self._is_deadline_error(error_str):
+                # Provide helpful guidance for deadline errors
+                error_msg = (
+                    "Research timed out on Google's servers. This query may be too complex.\n\n"
+                    "**Try:**\n"
+                    "- Breaking into smaller, focused questions\n"
+                    "- Using follow-up questions for additional depth\n"
+                    "- Simplifying the research scope"
+                )
+                await self._emit_error(__event_emitter__, "Research timed out")
+                yield f"\n\n**Error:** {error_msg}"
             else:
-                # Use polling mode
-                async for chunk in self._run_research_polling(
-                    query=query,
-                    api_key=api_key,
-                    event_emitter=__event_emitter__,
-                    previous_interaction_id=previous_interaction_id,
-                ):
-                    if chunk.startswith("__INTERACTION_ID__:"):
-                        interaction_id = chunk.split(":", 1)[1]
-                    else:
-                        yield chunk
-
-            # Store interaction_id for follow-ups via metadata
-            if interaction_id and __metadata__:
-                features = __metadata__.setdefault("features", {})
-                deep_research = features.setdefault("gemini_deep_research", {})
-                deep_research["last_interaction_id"] = interaction_id
-
-            # Emit completion status
-            await self._emit_status(__event_emitter__, "Research complete", done=True)
-
-        except asyncio.CancelledError:
-            log.info("Research cancelled by user")
-            await self._emit_status(__event_emitter__, "Research cancelled", done=True)
-            raise
-
-        except Exception as e:
-            log.exception(f"Deep Research failed: {e}")
-            await self._emit_error(__event_emitter__, f"Research failed: {e}")
-            yield f"\n\n**Error:** Research failed: {e}"
+                await self._emit_error(__event_emitter__, f"Research failed: {last_error}")
+                yield f"\n\n**Error:** Research failed: {last_error}"
 
     def _extract_research_query(self, messages: list[dict[str, Any]]) -> str:
         """
@@ -279,83 +321,99 @@ class Pipe:
                     await self._emit_status(event_emitter, "Research started", done=False)
 
                     # Parse SSE stream - Google puts event_type inside JSON data
-                    async for line in resp.content:
-                        line_str = line.decode("utf-8").strip()
+                    # NOTE: resp.content yields byte chunks, NOT lines. We must accumulate
+                    # bytes and split on newlines to correctly parse SSE format.
+                    buffer = ""
+                    async for chunk in resp.content:
+                        buffer += chunk.decode("utf-8")
 
-                        # Skip empty lines and non-data lines
-                        if not line_str or not line_str.startswith("data:"):
-                            continue
+                        # Process complete lines from buffer
+                        while "\n" in buffer:
+                            line_str, buffer = buffer.split("\n", 1)
+                            line_str = line_str.strip()
 
-                        json_str = line_str[5:].strip()  # Remove "data:" prefix
-                        if not json_str:
-                            continue
+                            # Skip empty lines and non-data lines
+                            if not line_str or not line_str.startswith("data:"):
+                                continue
 
-                        try:
-                            data = json.loads(json_str)
-                        except json.JSONDecodeError:
-                            log.debug(f"Skipping non-JSON SSE line: {json_str[:100]}")
-                            continue
+                            json_str = line_str[5:].strip()  # Remove "data:" prefix
+                            if not json_str:
+                                continue
 
-                        event_type = data.get("event_type", "")
-                        log.debug(f"SSE event: {event_type}")
+                            try:
+                                data = json.loads(json_str)
+                            except json.JSONDecodeError:
+                                log.debug(f"Skipping non-JSON SSE line: {json_str[:100]}")
+                                continue
 
-                        if event_type == "interaction.start":
-                            # Capture interaction ID for follow-ups
-                            interaction_id = data.get("interaction", {}).get("id", "")
-                            if interaction_id:
-                                log.info(f"Research started: {interaction_id}")
-                                yield f"__INTERACTION_ID__:{interaction_id}"
-                            await self._emit_status(event_emitter, "Research in progress", done=False)
+                            event_type = data.get("event_type", "")
+                            log.debug(f"SSE event: {event_type}")
 
-                        elif event_type == "content.delta":
-                            delta = data.get("delta", {})
-                            delta_type = delta.get("type", "")
+                            if event_type == "interaction.start":
+                                # Capture interaction ID for follow-ups
+                                interaction_id = data.get("interaction", {}).get("id", "")
+                                if interaction_id:
+                                    log.info(f"Research started: {interaction_id}")
+                                    yield f"__INTERACTION_ID__:{interaction_id}"
+                                await self._emit_status(event_emitter, "Research in progress", done=False)
 
-                            if delta_type == "thought_summary":
-                                # Research progress updates - try multiple locations
-                                summary = (
-                                    delta.get("content", {}).get("text", "")
-                                    or delta.get("text", "")
-                                    or delta.get("summary", "")
-                                    or ""
-                                )
-                                # Filter out "..." placeholders, require actual text
-                                # Strip markdown, whitespace, and trailing dots
-                                cleaned = summary.replace("**", "").strip().rstrip(".")
-                                if cleaned and any(c.isalnum() for c in cleaned):
-                                    await self._emit_status(event_emitter, cleaned[:100], done=False)
+                            elif event_type == "content.delta":
+                                delta = data.get("delta", {})
+                                delta_type = delta.get("type", "")
 
-                            else:
-                                # Text content - try multiple locations
-                                text = (
-                                    delta.get("text", "")
-                                    or delta.get("content", {}).get("text", "")
-                                    or delta.get("message", "")
-                                    or ""
-                                )
-                                if text:
-                                    yield text
+                                if delta_type == "thought_summary":
+                                    # Research progress updates - try multiple locations
+                                    summary = (
+                                        delta.get("content", {}).get("text", "")
+                                        or delta.get("text", "")
+                                        or delta.get("summary", "")
+                                        or ""
+                                    )
+                                    # Filter out "..." placeholders, require actual text
+                                    # Strip markdown, whitespace, and trailing dots
+                                    cleaned = summary.replace("**", "").strip().rstrip(".")
+                                    if cleaned and any(c.isalnum() for c in cleaned):
+                                        await self._emit_status(event_emitter, cleaned[:100], done=False)
 
-                        elif event_type == "interaction.complete":
-                            log.info("Research completed via SSE")
-                            # Try to extract final content from outputs
-                            interaction = data.get("interaction", {})
-                            outputs = interaction.get("outputs", [])
-                            for output in outputs:
-                                if isinstance(output, dict):
-                                    text = output.get("text", "")
+                                else:
+                                    # Text content - try multiple locations
+                                    text = (
+                                        delta.get("text", "")
+                                        or delta.get("content", {}).get("text", "")
+                                        or delta.get("message", "")
+                                        or ""
+                                    )
                                     if text:
                                         yield text
-                                elif isinstance(output, str):
-                                    yield output
 
-                        elif event_type == "error":
-                            error_msg = data.get("error", {}).get("message", "Unknown error")
-                            raise Exception(f"Research error: {error_msg}")
+                            elif event_type == "interaction.complete":
+                                log.info("Research completed via SSE")
+                                # Try to extract final content from outputs
+                                interaction = data.get("interaction", {})
+                                outputs = interaction.get("outputs", [])
+                                if outputs:
+                                    for output in outputs:
+                                        if isinstance(output, dict):
+                                            text = output.get("text", "")
+                                            if text:
+                                                yield text
+                                        elif isinstance(output, str):
+                                            yield output
+                                else:
+                                    # Fallback: try alternative response format (parity with polling)
+                                    response = interaction.get("response", {})
+                                    if isinstance(response, dict):
+                                        text = response.get("text", "")
+                                        if text:
+                                            yield text
 
-                        elif event_type:
-                            # Log unhandled event types for debugging
-                            log.debug(f"Unhandled event type: {event_type}")
+                            elif event_type == "error":
+                                error_msg = data.get("error", {}).get("message", "Unknown error")
+                                raise Exception(f"Research error: {error_msg}")
+
+                            elif event_type:
+                                # Log unhandled event types for debugging
+                                log.debug(f"Unhandled event type: {event_type}")
 
         except aiohttp.ClientError as e:
             log.warning(f"SSE streaming failed, falling back to polling: {e}")
@@ -535,3 +593,26 @@ class Pipe:
             )
         except Exception as e:
             log.warning(f"Failed to emit error: {e}")
+
+    async def _emit_notification(
+        self,
+        event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None,
+        content: str,
+        *,
+        level: Literal["info", "success", "warning", "error"] = "info",
+    ) -> None:
+        """Emit a toast notification to the UI."""
+        if not event_emitter:
+            return
+
+        try:
+            await event_emitter({
+                "type": "notification",
+                "data": {"type": level, "content": content}
+            })
+        except Exception as e:
+            log.warning(f"Failed to emit notification: {e}")
+
+    def _is_deadline_error(self, error_msg: str) -> bool:
+        """Check if error is a Google deadline timeout."""
+        return "deadline expired" in error_msg.lower()

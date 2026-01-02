@@ -1,8 +1,8 @@
 """
 title: Nano Banana Pro
 id: nano_banana_pro
-version: 0.4.1
-description: AI-callable tool for generating illustrative images. Models can create diagrams, illustrations, and visual explanations when helpful.
+version: 0.5.0
+description: Leverage Google's latest image generation to create images on request.
 license: MIT
 requirements: google-genai>=1.0.0
 """
@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 
 
 class Tools:
-    """Nano Banana Pro - image generation tool for AI-driven visual content creation."""
+    """Nano Banana Pro - image generation tool."""
 
     class Valves(BaseModel):
         GEMINI_API_KEY: str = Field(
@@ -43,7 +43,7 @@ class Tools:
     def __init__(self):
         self.valves = self.Valves()
 
-    async def create_visual(
+    async def generate_image(
         self,
         description: str,
         aspect_ratio: str | None = None,
@@ -51,32 +51,23 @@ class Tools:
         __event_emitter__: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> str:
         """
-        Generate an illustrative image to help explain concepts visually.
-
-        WHEN TO USE:
-        - Diagrams showing relationships, processes, or architectures
-        - Illustrations of abstract concepts that benefit from visualization
-        - Visual examples of objects, scenes, or UI mockups
-        - Educational illustrations, charts, or infographics
-
-        DO NOT USE FOR: user-requested artwork, portraits of real people,
-        or inappropriate content.
+        Generate an image from a text description.
 
         PROMPTING BEST PRACTICES:
         - Write natural, descriptive sentences (not keywords)
-        - Specify visual style: "clean minimalist diagram", "colorful illustration", "technical schematic"
-        - Describe composition: "centered", "left-to-right flow", "hierarchical tree structure"
-        - Include colors if important: "blue boxes connected by gray arrows"
-        - Mention text/labels to include: "labeled with 'Input', 'Process', 'Output'"
-        - State the mood/tone: "professional", "friendly", "technical"
+        - Specify visual style: "oil painting", "photorealistic", "cartoon", "watercolor", "pencil sketch"
+        - Describe composition: "centered", "close-up", "wide angle", "from above"
+        - Include colors if important: "vibrant sunset colors", "muted earth tones"
+        - Mention lighting: "golden hour lighting", "dramatic shadows", "soft diffused light"
+        - State the mood/tone: "serene", "energetic", "mysterious", "whimsical"
 
         EXAMPLE PROMPTS:
-        - "A clean flowchart showing the software development lifecycle with boxes for Planning, Development, Testing, and Deployment connected by arrows, using blue and gray colors on white background"
-        - "A friendly illustration of a neural network with input nodes on the left, hidden layers in the middle, and output on the right, using soft colors and rounded shapes"
+        - "A cozy coffee shop interior with warm lighting, wooden furniture, and rain visible through large windows, photorealistic style"
+        - "A majestic mountain landscape at sunset with a lake reflection, vibrant orange and purple sky, oil painting style"
 
-        :param description: Natural language description of the image. Be specific about style, composition, colors, and any text/labels to include.
-        :param aspect_ratio: Optional aspect ratio (1:1, 16:9, 9:16, 4:3, 3:4). Use 16:9 for diagrams, 1:1 for icons.
-        :return: Confirmation that the image was generated and displayed.
+        :param description: Natural language description of the image. Be specific about style, composition, colors, and mood.
+        :param aspect_ratio: Aspect ratio (1:1, 16:9, 9:16, 4:3, 3:4). Default 16:9.
+        :return: Confirmation message.
         """
         # Validate API key
         if not self.valves.GEMINI_API_KEY:
@@ -141,7 +132,7 @@ class Tools:
                         if __event_emitter__ and __user__:
                             file_id = str(uuid.uuid4())
                             ext = "png" if "png" in mime_type else "jpg"
-                            filename = f"generated_{file_id[:8]}.{ext}"
+                            filename = f"nano_banana_{file_id[:8]}.{ext}"
                             stored_filename = f"{file_id}_{filename}"
 
                             # Upload file to storage
