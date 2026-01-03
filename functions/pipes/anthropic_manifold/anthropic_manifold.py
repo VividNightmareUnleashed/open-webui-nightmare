@@ -4,7 +4,7 @@ id: anthropic_manifold
 author: Based on original by justinh-rahb, christian-taillon, Mark Kazakov, Vincent, NIK-NUB, Snav
 description: Full-featured Anthropic Claude API integration with extended thinking, web search, tool calling, and more.
 required_open_webui_version: 0.6.10
-version: 1.2.1
+version: 1.2.2
 license: MIT
 """
 
@@ -912,6 +912,7 @@ class Pipe:
             OUTPUT_CHUNK_TARGET = 96
             OUTPUT_CHUNK_MAX = 32768
             CODE_FENCE_RE = re.compile(r"(?m)^[ \t]*```")
+            CODE_FENCE_TICKS_RE = re.compile(r"(?m)^[ \t]{0,3}(`{3,})")
 
             def _has_unclosed_html_tag(text: str) -> bool:
                 last_lt = text.rfind("<")
@@ -996,6 +997,16 @@ class Pipe:
                         break
                     chunks.append(chunk)
                 return chunks
+
+            def _format_code_block(content: str, language: str | None = None) -> str:
+                """Wrap arbitrary content in a fenced code block that won't be closed by inner fences."""
+                content = (content or "").rstrip("\n")
+                info = (language or "").strip().splitlines()[0]
+                max_ticks = 0
+                for match in CODE_FENCE_TICKS_RE.finditer(content):
+                    max_ticks = max(max_ticks, len(match.group(1)))
+                fence = "`" * max(3, max_ticks + 1)
+                return f"\n{fence}{info}\n{content}\n{fence}\n"
 
             try:
                 async with session.post(
@@ -1171,13 +1182,13 @@ class Pipe:
                                 return_code = result_content.get("return_code", 0)
 
                                 if stdout:
-                                    output_text = f"\n```output\n{stdout}\n```\n"
+                                    output_text = _format_code_block(stdout, "output")
                                     accumulated_text += output_text
                                     while (chunk := _pop_flushable_chunk(force=True)):
                                         yield chunk
                                     yield output_text
                                 if stderr:
-                                    stderr_text = f"\n```stderr\n{stderr}\n```\n"
+                                    stderr_text = _format_code_block(stderr, "stderr")
                                     accumulated_text += stderr_text
                                     while (chunk := _pop_flushable_chunk(force=True)):
                                         yield chunk
@@ -1203,7 +1214,7 @@ class Pipe:
                                 file_type = result_content.get("file_type", "text")
 
                                 if file_content:
-                                    content_text = f"\n```{file_type}\n{file_content}\n```\n"
+                                    content_text = _format_code_block(file_content, file_type)
                                     accumulated_text += content_text
                                     while (chunk := _pop_flushable_chunk(force=True)):
                                         yield chunk
@@ -1269,7 +1280,7 @@ class Pipe:
                                     command = tool_input.get("command", "")
                                     if command:
                                         lang = "python" if command.strip().startswith("python") else "bash"
-                                        code_block = f"\n```{lang}\n{command}\n```\n"
+                                        code_block = _format_code_block(command, lang)
                                         accumulated_text += code_block
                                         while (chunk := _pop_flushable_chunk(force=True)):
                                             yield chunk
@@ -1282,7 +1293,7 @@ class Pipe:
 
                                     if cmd == "create" and content:
                                         ext = path.split(".")[-1] if "." in path else "text"
-                                        code_block = f"\n**Creating `{path}`:**\n```{ext}\n{content}\n```\n"
+                                        code_block = f"\n**Creating `{path}`:**{_format_code_block(content, ext)}"
                                         accumulated_text += code_block
                                         while (chunk := _pop_flushable_chunk(force=True)):
                                             yield chunk
@@ -1291,7 +1302,7 @@ class Pipe:
                                         old_str = tool_input.get("old_str", "")
                                         new_str = tool_input.get("new_str", "")
                                         if old_str or new_str:
-                                            edit_block = f"\n**Editing `{path}`:**\n```diff\n- {old_str}\n+ {new_str}\n```\n"
+                                            edit_block = f"\n**Editing `{path}`:**{_format_code_block(f'- {old_str}\n+ {new_str}', 'diff')}"
                                             accumulated_text += edit_block
                                             while (chunk := _pop_flushable_chunk(force=True)):
                                                 yield chunk

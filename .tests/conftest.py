@@ -5,6 +5,14 @@ import types
 open_webui = types.ModuleType("open_webui")
 models_mod = types.ModuleType("open_webui.models")
 chats_mod = types.ModuleType("open_webui.models.chats")
+files_mod = types.ModuleType("open_webui.models.files")
+storage_mod = types.ModuleType("open_webui.storage")
+storage_provider_mod = types.ModuleType("open_webui.storage.provider")
+
+# Mark as packages so `import open_webui.models.*` works.
+open_webui.__path__ = []  # type: ignore[attr-defined]
+models_mod.__path__ = []  # type: ignore[attr-defined]
+storage_mod.__path__ = []  # type: ignore[attr-defined]
 
 class Chats:
     @staticmethod
@@ -49,6 +57,39 @@ models_models_mod.ModelForm = ModelForm
 models_models_mod.ModelParams = ModelParams
 models_models_mod.Model = Model
 models_models_mod.ModelMeta = ModelMeta
+
+# --- Files stub -------------------------------------------------------------
+class DummyFile:
+    def __init__(self, *, id: str, user_id: str, filename: str, path: str, meta: dict | None = None):
+        self.id = id
+        self.user_id = user_id
+        self.filename = filename
+        self.path = path
+        self.meta = meta or {}
+
+
+class Files:
+    @staticmethod
+    def get_file_by_id(file_id):
+        return None
+
+    @staticmethod
+    def get_file_by_id_and_user_id(file_id, user_id):
+        return None
+
+
+Files.DummyFile = DummyFile  # type: ignore[attr-defined]
+files_mod.Files = Files
+files_mod.DummyFile = DummyFile
+
+# --- Storage stub -----------------------------------------------------------
+class Storage:
+    @staticmethod
+    def get_file(file_path: str) -> str:
+        return file_path
+
+
+storage_provider_mod.Storage = Storage
 
 utils_mod = types.ModuleType("open_webui.utils")
 misc_mod = types.ModuleType("open_webui.utils.misc")
@@ -95,7 +136,10 @@ internal_db_mod.get_db = get_db
 sys.modules.setdefault("open_webui", open_webui)
 sys.modules.setdefault("open_webui.models", models_mod)
 sys.modules.setdefault("open_webui.models.chats", chats_mod)
+sys.modules.setdefault("open_webui.models.files", files_mod)
 sys.modules.setdefault("open_webui.models.models", models_models_mod)
+sys.modules.setdefault("open_webui.storage", storage_mod)
+sys.modules.setdefault("open_webui.storage.provider", storage_provider_mod)
 sys.modules.setdefault("open_webui.utils", utils_mod)
 sys.modules.setdefault("open_webui.utils.misc", misc_mod)
 sys.modules.setdefault("open_webui.tasks", tasks_mod)

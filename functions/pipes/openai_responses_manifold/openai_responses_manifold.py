@@ -6,7 +6,7 @@ author_url: https://github.com/jrkropp
 git_url: https://github.com/jrkropp/open-webui-developer-toolkit/blob/main/functions/pipes/openai_responses_manifold/openai_responses_manifold.py
 description: Brings OpenAI Response API support to Open WebUI, enabling features not possible via Completions API.
 required_open_webui_version: 0.6.3
-version: 0.8.28
+version: 0.8.29
 license: MIT
 """
 
@@ -705,6 +705,7 @@ class Pipe:
         __event_emitter__: Callable[[dict[str, Any]], Awaitable[None]],
         __metadata__: dict[str, Any],
         __tools__: list[dict[str, Any]] | dict[str, Any] | None,
+        __files__: list[dict[str, Any]] | None = None,
         __task__: Optional[dict[str, Any]] = None,
         __task_body__: Optional[dict[str, Any]] = None,
         __event_call__: Callable[[dict[str, Any]], Awaitable[Any]] | None = None,
@@ -736,6 +737,7 @@ class Pipe:
             # Additional optional parameters passed directly to ResponsesBody without validation. Overrides any parameters in the original body with the same name.
             truncation=valves.TRUNCATION,
             user=user_identifier,
+            parallel_tool_calls=valves.PARALLEL_TOOL_CALLS,
             **({"max_tool_calls": valves.MAX_TOOL_CALLS} if valves.MAX_TOOL_CALLS is not None else {}),
         )
 
@@ -791,6 +793,180 @@ class Pipe:
             mcp_tools = ResponsesBody._build_mcp_tools(valves.REMOTE_MCP_SERVERS_JSON)
             if mcp_tools:
                 responses_body.tools = (responses_body.tools or []) + mcp_tools
+
+        # Built-in OpenAI tools: code_interpreter + file_search (requires OpenAI uploads)
+        features_root = __metadata__.get("features") or {}
+        features_root = features_root if isinstance(features_root, dict) else {}
+        openai_features = features if isinstance(features, dict) else {}
+
+        code_interpreter_enabled = bool(
+            valves.ENABLE_CODE_INTERPRETER_TOOL
+            or openai_features.get("code_interpreter", False)
+            or features_root.get("code_interpreter", False)
+        )
+        file_search_enabled = bool(
+            valves.ENABLE_FILE_SEARCH_TOOL
+            or openai_features.get("file_search", False)
+            or features_root.get("file_search", False)
+        )
+
+        model_supports_code_interpreter = model_family in FEATURE_SUPPORT["code_interpreter_tool"]
+        model_supports_file_search = model_family in FEATURE_SUPPORT["file_search_tool"]
+
+        # File citations (OpenAI file_id -> Open WebUI file link)
+        openai_file_citations: dict[str, dict[str, str]] = {}
+        uploaded_openai_file_ids: list[str] = []
+
+        should_prepare_file_uploads = bool(
+            __files__
+            and valves.ALLOW_OPENAI_FILE_UPLOADS
+            and (
+                (code_interpreter_enabled and model_supports_code_interpreter)
+                or (file_search_enabled and model_supports_file_search)
+            )
+        )
+
+        if (__files__ and (code_interpreter_enabled or file_search_enabled)) and not valves.ALLOW_OPENAI_FILE_UPLOADS:
+            await self._emit_notification(
+                __event_emitter__,
+                content=(
+                    "OpenAI file uploads are disabled for this manifold. "
+                    "Enable `ALLOW_OPENAI_FILE_UPLOADS` to use file-backed Code Interpreter or File Search."
+                ),
+                level="warning",
+            )
+
+        if code_interpreter_enabled and not model_supports_code_interpreter:
+            await self._emit_notification(
+                __event_emitter__,
+                content=f"Model `{responses_body.model}` does not support OpenAI code interpreter tools.",
+                level="warning",
+            )
+
+        if file_search_enabled and not model_supports_file_search:
+            await self._emit_notification(
+                __event_emitter__,
+                content=f"Model `{responses_body.model}` does not support OpenAI file search tools.",
+                level="warning",
+            )
+
+        if should_prepare_file_uploads:
+            openwebui_user_id = str((__user__ or {}).get("id") or "")
+            attachments = self._collect_openwebui_file_attachments(__files__, user_id=openwebui_user_id)
+
+            try:
+                uploaded_openai_file_ids, openai_file_citations = await self._ensure_openai_file_uploads(
+                    attachments,
+                    chat_id=__metadata__.get("chat_id"),
+                    user_id=openwebui_user_id,
+                    valves=valves,
+                    event_emitter=__event_emitter__,
+                )
+            except Exception as e:
+                await self._emit_notification(
+                    __event_emitter__,
+                    content=f"Failed to upload files to OpenAI: {e}",
+                    level="error",
+                )
+                uploaded_openai_file_ids = []
+                openai_file_citations = {}
+
+            # Extend citation mapping with per-chat cache (so older files in the vector store can cite cleanly)
+            _, file_tools_state = self._get_or_init_file_tools_state(__metadata__.get("chat_id"))
+            openai_files_cache = (file_tools_state or {}).get("openai_files", {}) if isinstance(file_tools_state, dict) else {}
+            if isinstance(openai_files_cache, dict):
+                for ow_id, entry in openai_files_cache.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    oai_id = (entry.get("openai_file_id") or "").strip()
+                    if not oai_id:
+                        continue
+                    openai_file_citations.setdefault(
+                        oai_id,
+                        {"openwebui_file_id": str(ow_id), "filename": str(entry.get("filename") or "")},
+                    )
+
+            # Rewrite any `input_file` blocks that reference Open WebUI file IDs.
+            if uploaded_openai_file_ids and isinstance(responses_body.input, list):
+                openwebui_to_openai = {
+                    info.get("openwebui_file_id", ""): openai_id
+                    for openai_id, info in openai_file_citations.items()
+                    if isinstance(info, dict) and info.get("openwebui_file_id")
+                }
+                for msg in responses_body.input:
+                    if not isinstance(msg, dict) or msg.get("role") != "user":
+                        continue
+                    content_blocks = msg.get("content")
+                    if not isinstance(content_blocks, list):
+                        continue
+                    for block in content_blocks:
+                        if not isinstance(block, dict) or block.get("type") != "input_file":
+                            continue
+                        fid = block.get("file_id")
+                        if isinstance(fid, str) and fid in openwebui_to_openai:
+                            block["file_id"] = openwebui_to_openai[fid]
+
+        # Enable Code Interpreter (files optional; files require uploads)
+        if code_interpreter_enabled and model_supports_code_interpreter:
+            responses_body.tools = responses_body.tools or []
+            if not any(isinstance(t, dict) and t.get("type") == "code_interpreter" for t in responses_body.tools):
+                responses_body.tools.append({"type": "code_interpreter"})
+
+            if uploaded_openai_file_ids:
+                current_resources = responses_body.tool_resources if isinstance(responses_body.tool_resources, dict) else {}
+                responses_body.tool_resources = dict(current_resources)
+                code_resources = responses_body.tool_resources.get("code_interpreter")
+                code_resources = dict(code_resources) if isinstance(code_resources, dict) else {}
+                existing_file_ids = code_resources.get("file_ids") if isinstance(code_resources.get("file_ids"), list) else []
+                code_resources["file_ids"] = self._dedupe_preserve_order(existing_file_ids + uploaded_openai_file_ids)
+                responses_body.tool_resources["code_interpreter"] = code_resources
+
+        # Enable File Search (requires uploads + at least one file)
+        if file_search_enabled and model_supports_file_search:
+            if not __files__:
+                await self._emit_notification(
+                    __event_emitter__,
+                    content="File Search is enabled, but no files are attached to this message.",
+                    level="warning",
+                )
+            elif not valves.ALLOW_OPENAI_FILE_UPLOADS:
+                pass
+            elif not uploaded_openai_file_ids:
+                await self._emit_notification(
+                    __event_emitter__,
+                    content="File Search is enabled, but no files were uploaded to OpenAI (check size limits and permissions).",
+                    level="warning",
+                )
+            else:
+                try:
+                    vector_store_id = await self._ensure_vector_store_indexed(
+                        uploaded_openai_file_ids,
+                        chat_id=__metadata__.get("chat_id"),
+                        valves=valves,
+                        event_emitter=__event_emitter__,
+                    )
+                except Exception as e:
+                    await self._emit_notification(
+                        __event_emitter__,
+                        content=f"Failed to prepare OpenAI File Search index: {e}",
+                        level="error",
+                    )
+                else:
+                    responses_body.tools = responses_body.tools or []
+                    if not any(isinstance(t, dict) and t.get("type") == "file_search" for t in responses_body.tools):
+                        responses_body.tools.append({"type": "file_search"})
+
+                    current_resources = responses_body.tool_resources if isinstance(responses_body.tool_resources, dict) else {}
+                    responses_body.tool_resources = dict(current_resources)
+                    file_search_resources = responses_body.tool_resources.get("file_search")
+                    file_search_resources = dict(file_search_resources) if isinstance(file_search_resources, dict) else {}
+                    existing_vs_ids = (
+                        file_search_resources.get("vector_store_ids")
+                        if isinstance(file_search_resources.get("vector_store_ids"), list)
+                        else []
+                    )
+                    file_search_resources["vector_store_ids"] = self._dedupe_preserve_order(existing_vs_ids + [vector_store_id])
+                    responses_body.tool_resources["file_search"] = file_search_resources
 
         # Check if tools are enabled but native function calling is disabled
         # If so, update the OpenWebUI model parameter to enable native function calling for future requests.
@@ -864,7 +1040,14 @@ class Pipe:
         # Send to OpenAI Responses API
         if responses_body.stream:
             # Return async generator for partial text
-            return await self._run_streaming_loop(responses_body, valves, __event_emitter__, __metadata__, __tools__)
+            return await self._run_streaming_loop(
+                responses_body,
+                valves,
+                __event_emitter__,
+                __metadata__,
+                __tools__,
+                openai_file_citations=openai_file_citations,
+            )
         else:
             # Return final text (non-streaming)
             return await self._run_nonstreaming_loop(responses_body, valves, __event_emitter__, __metadata__, __tools__)
@@ -877,6 +1060,7 @@ class Pipe:
         event_emitter: Callable[[Dict[str, Any]], Awaitable[None]],
         metadata: dict[str, Any] = {},
         tools: Optional[Dict[str, Dict[str, Any]]] = None,
+        openai_file_citations: dict[str, dict[str, str]] | None = None,
     ):
         """
         Stream assistant responses incrementally, handling function calls, status updates, and tool usage.
@@ -946,32 +1130,76 @@ class Pipe:
                             )
                         continue
 
-                    # ─── Emit annotation
+                    # ─── Emit annotation (web + file citations) ───────────────────────────
                     if etype == "response.output_text.annotation.added":
-                        ann = event["annotation"]
-                        url = ann.get("url", "").removesuffix("?utm_source=openai")
-                        title = ann.get("title", "").strip()
-                        domain = urlparse(url).netloc.lower().lstrip('www.')
+                        ann = event.get("annotation") or {}
+                        if not isinstance(ann, dict):
+                            continue
 
-                        # Have we already cited this URL?
-                        already_cited = url in ordinal_by_url
+                        url = (ann.get("url") or "").removesuffix("?utm_source=openai").strip()
+                        title = (ann.get("title") or "").strip()
 
-                        if already_cited:
-                            # Reuse the original citation number
-                            citation_number = ordinal_by_url[url]
+                        source_key = ""
+                        source_name = ""
+                        source_url = ""
+                        doc_text = ""
+                        strip_domain: str | None = None
+
+                        if url:
+                            domain = urlparse(url).netloc.lower().lstrip("www.")
+                            source_key = url
+                            source_name = domain or url
+                            source_url = url
+                            doc_text = title or url
+                            strip_domain = domain or None
                         else:
-                            # Assign next available number to this new citation URL
-                            citation_number = len(ordinal_by_url) + 1
-                            ordinal_by_url[url] = citation_number
+                            # File citation (e.g., from `file_search`)
+                            openai_file_id = (ann.get("file_id") or "").strip()
+                            if not openai_file_id and isinstance(ann.get("file_citation"), dict):
+                                openai_file_id = (ann["file_citation"].get("file_id") or "").strip()
 
-                            # Emit the citation event now, because it's new
+                            file_info = (openai_file_citations or {}).get(openai_file_id, {}) if openai_file_id else {}
+                            openwebui_file_id = (file_info.get("openwebui_file_id") or "").strip()
+                            filename = (
+                                (file_info.get("filename") or "").strip()
+                                or (ann.get("filename") or "").strip()
+                                or "file"
+                            )
+
+                            if openwebui_file_id:
+                                source_url = f"/api/v1/files/{openwebui_file_id}/content"
+                            source_key = source_url or f"openai_file:{openai_file_id or filename}"
+                            source_name = filename
+
+                            quote = ""
+                            if isinstance(ann.get("file_citation"), dict):
+                                quote = (ann["file_citation"].get("quote") or "").strip()
+                            quote = quote or (ann.get("quote") or "").strip()
+                            doc_text = quote or title or filename
+
+                        if not source_key:
+                            continue
+
+                        # Have we already cited this source?
+                        already_cited = source_key in ordinal_by_url
+                        if already_cited:
+                            citation_number = ordinal_by_url[source_key]
+                        else:
+                            citation_number = len(ordinal_by_url) + 1
+                            ordinal_by_url[source_key] = citation_number
+
                             citation_payload = {
-                                "source": {"name": domain, "url": url},
-                                "document": [title],  # or snippet if you have it
-                                "metadata": [{
-                                    "source": url,
-                                    "date_accessed": datetime.date.today().isoformat(),
-                                }],
+                                "source": {
+                                    "name": source_name,
+                                    **({"url": source_url} if source_url else {}),
+                                },
+                                "document": [doc_text],
+                                "metadata": [
+                                    {
+                                        "source": source_url or source_name,
+                                        "date_accessed": datetime.date.today().isoformat(),
+                                    }
+                                ],
                             }
                             await event_emitter({"type": "source", "data": citation_payload})
                             emitted_citations.append(citation_payload)
@@ -979,19 +1207,18 @@ class Pipe:
                         # Insert the citation marker into the message text
                         assistant_message += f" [{citation_number}]"
 
-                        # Remove the markdown link originally printed by the model
-                        assistant_message = re.sub(
-                            rf"\(\s*\[\s*{re.escape(domain)}\s*\]\([^)]+\)\s*\)",
-                            " ",
-                            assistant_message,
-                            count=1,
-                        ).strip()
+                        # Remove the markdown link originally printed by the model (web search only)
+                        if strip_domain:
+                            assistant_message = re.sub(
+                                rf"\(\s*\[\s*{re.escape(strip_domain)}\s*\]\([^)]+\)\s*\)",
+                                " ",
+                                assistant_message,
+                                count=1,
+                            ).strip()
 
-                        # Send updated assistant message chunk to UI
-                        await event_emitter({
-                            "type": "chat:message",
-                            "data": {"content": assistant_message},
-                        })
+                        await event_emitter(
+                            {"type": "chat:message", "data": {"content": assistant_message}}
+                        )
                         continue
 
                     # ─── Emit status updates for in-progress items ──────────────────────
@@ -1510,7 +1737,443 @@ class Pipe:
         )
 
         return session
-    
+
+    # 4.5.1 OpenAI File Tools Helpers (Uploads / Vector Stores)
+    @staticmethod
+    def _dedupe_preserve_order(items: list[str]) -> list[str]:
+        return list(dict.fromkeys([i for i in items if i]))
+
+    def _get_or_init_file_tools_state(
+        self,
+        chat_id: str | None,
+    ) -> tuple[Any | None, dict[str, Any] | None]:
+        """Return ``(chat_model, file_tools_state)`` for persisting OpenAI file-tool metadata."""
+        if not chat_id:
+            return None, None
+
+        chat_model = Chats.get_chat_by_id(chat_id)
+        if not chat_model:
+            return None, None
+
+        pipe_root = chat_model.chat.setdefault("openai_responses_pipe", {"__v": 3})
+        file_tools = pipe_root.setdefault(
+            "file_tools",
+            {"__v": 1, "openai_files": {}, "vector_store": {}},
+        )
+        return chat_model, file_tools
+
+    def _collect_openwebui_file_attachments(
+        self,
+        raw_files: list[dict[str, Any]] | None,
+        *,
+        user_id: str,
+    ) -> list[_OpenWebUIFileAttachment]:
+        """Resolve ``__files__`` entries into local file paths (via Storage) with access checks."""
+        if not raw_files:
+            return []
+
+        attachments: list[_OpenWebUIFileAttachment] = []
+        seen: set[str] = set()
+
+        for item in raw_files:
+            if not isinstance(item, dict):
+                continue
+
+            file_id = (item.get("id") or item.get("file_id") or "").strip()
+            if not file_id or file_id in seen:
+                continue
+            seen.add(file_id)
+
+            injected_name = (item.get("name") or item.get("filename") or "").strip()
+
+            file_model = None
+            get_by_user = getattr(Files, "get_file_by_id_and_user_id", None)
+            if callable(get_by_user):
+                file_model = get_by_user(file_id, user_id)
+            if file_model is None:
+                get_by_id = getattr(Files, "get_file_by_id", None)
+                if callable(get_by_id):
+                    file_model = get_by_id(file_id)
+                if file_model is not None and getattr(file_model, "user_id", user_id) != user_id:
+                    continue
+
+            if not file_model:
+                continue
+
+            storage_path = getattr(file_model, "path", None) or ""
+            if not storage_path:
+                continue
+
+            try:
+                local_path = Storage.get_file(storage_path)
+            except Exception:
+                continue
+
+            local_file = Path(str(local_path))
+            if not local_file.is_file():
+                continue
+
+            filename = injected_name or getattr(file_model, "filename", "") or local_file.name
+
+            meta = getattr(file_model, "meta", None)
+            content_type = None
+            if isinstance(meta, dict):
+                content_type = meta.get("content_type") or meta.get("type")
+            if not content_type:
+                content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+            size_bytes = None
+            if isinstance(meta, dict) and meta.get("size") is not None:
+                try:
+                    size_bytes = int(meta["size"])
+                except (TypeError, ValueError):
+                    size_bytes = None
+            if size_bytes is None:
+                try:
+                    size_bytes = local_file.stat().st_size
+                except OSError:
+                    continue
+
+            attachments.append(
+                _OpenWebUIFileAttachment(
+                    id=file_id,
+                    filename=filename,
+                    local_path=str(local_file),
+                    size_bytes=size_bytes,
+                    content_type=content_type,
+                )
+            )
+
+        return attachments
+
+    async def _openai_api_request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        api_key: str,
+        base_url: str,
+        json_body: dict[str, Any] | None = None,
+        beta_assistants_v2: bool = False,
+    ) -> dict[str, Any]:
+        """Send a JSON request to an OpenAI REST endpoint (non-Responses)."""
+        self.session = await self._get_or_init_http_session()
+
+        headers: dict[str, str] = {"Authorization": f"Bearer {api_key}"}
+        if json_body is not None:
+            headers["Content-Type"] = "application/json"
+        if beta_assistants_v2:
+            headers["OpenAI-Beta"] = "assistants=v2"
+
+        url = base_url.rstrip("/") + path
+        async with self.session.request(method.upper(), url, json=json_body, headers=headers) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+    async def _openai_api_upload_file(
+        self,
+        attachment: _OpenWebUIFileAttachment,
+        *,
+        api_key: str,
+        base_url: str,
+        purpose: str,
+    ) -> str:
+        """Upload a local file to OpenAI Files API and return the OpenAI file id."""
+        self.session = await self._get_or_init_http_session()
+
+        url = base_url.rstrip("/") + "/files"
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        form = aiohttp.FormData()
+        form.add_field("purpose", purpose)
+
+        with open(attachment.local_path, "rb") as f:
+            form.add_field(
+                "file",
+                f,
+                filename=attachment.filename,
+                content_type=attachment.content_type,
+            )
+            async with self.session.post(url, data=form, headers=headers) as resp:
+                resp.raise_for_status()
+                payload = await resp.json()
+
+        file_id = (payload.get("id") or "").strip()
+        if not file_id:
+            raise ValueError("OpenAI file upload returned no id")
+        return file_id
+
+    async def _ensure_openai_file_uploads(
+        self,
+        attachments: list[_OpenWebUIFileAttachment],
+        *,
+        chat_id: str | None,
+        user_id: str,
+        valves: "Pipe.Valves",
+        event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None,
+    ) -> tuple[list[str], dict[str, dict[str, str]]]:
+        """Upload Open WebUI files to OpenAI (with optional per-chat caching).
+
+        Returns ``(openai_file_ids, openai_file_id -> {openwebui_file_id, filename})``.
+        """
+        if not attachments:
+            return [], {}
+
+        if not valves.ALLOW_OPENAI_FILE_UPLOADS:
+            return [], {}
+
+        chat_model, file_tools = self._get_or_init_file_tools_state(chat_id)
+        openai_files_cache: dict[str, Any] = {}
+        if file_tools is not None:
+            openai_files_cache = file_tools.setdefault("openai_files", {})
+
+        max_bytes = int(valves.FILE_UPLOAD_MAX_MB) * 1024 * 1024
+        openai_file_ids: list[str] = []
+        citation_map: dict[str, dict[str, str]] = {}
+
+        changed = False
+        skipped: list[str] = []
+
+        for att in attachments:
+            if att.size_bytes > max_bytes:
+                skipped.append(att.filename)
+                continue
+
+            cached = openai_files_cache.get(att.id) if openai_files_cache else None
+            cached_id = (cached or {}).get("openai_file_id") if isinstance(cached, dict) else None
+            openai_file_id = (cached_id or "").strip() if isinstance(cached_id, str) else ""
+
+            if not openai_file_id:
+                if event_emitter is not None:
+                    await self._emit_status(
+                        event_emitter,
+                        f"Uploading `{att.filename}` to OpenAI…",
+                        hidden=True,
+                    )
+
+                openai_file_id = await self._openai_api_upload_file(
+                    att,
+                    api_key=valves.API_KEY,
+                    base_url=valves.BASE_URL,
+                    purpose=valves.FILE_UPLOAD_PURPOSE,
+                )
+
+                if openai_files_cache is not None:
+                    openai_files_cache[att.id] = {
+                        "openai_file_id": openai_file_id,
+                        "filename": att.filename,
+                        "created_at": int(time.time()),
+                    }
+                    changed = True
+
+            openai_file_ids.append(openai_file_id)
+            citation_map[openai_file_id] = {
+                "openwebui_file_id": att.id,
+                "filename": att.filename,
+            }
+
+        if skipped and event_emitter is not None:
+            await self._emit_notification(
+                event_emitter,
+                content=(
+                    f"Skipped {len(skipped)} file(s) larger than {valves.FILE_UPLOAD_MAX_MB}MB: "
+                    + ", ".join(f"`{s}`" for s in skipped)
+                ),
+                level="warning",
+            )
+
+        if changed and chat_model is not None and chat_id:
+            Chats.update_chat_by_id(chat_id, chat_model.chat)
+
+        return self._dedupe_preserve_order(openai_file_ids), citation_map
+
+    async def _ensure_vector_store_indexed(
+        self,
+        openai_file_ids: list[str],
+        *,
+        chat_id: str | None,
+        valves: "Pipe.Valves",
+        event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None,
+    ) -> str:
+        """Create/reuse a vector store and ensure the given files are indexed into it."""
+        if not openai_file_ids:
+            raise ValueError("No OpenAI file IDs to index")
+
+        chat_model, file_tools = self._get_or_init_file_tools_state(
+            chat_id if valves.VECTOR_STORE_REUSE_PER_CHAT else None
+        )
+        vector_store_state: dict[str, Any] | None = None
+        if file_tools is not None:
+            vector_store_state = file_tools.setdefault("vector_store", {})
+
+        vector_store_id = (vector_store_state or {}).get("id") if isinstance(vector_store_state, dict) else None
+        vector_store_id = vector_store_id.strip() if isinstance(vector_store_id, str) else ""
+
+        indexed_ids: set[str] = set()
+        if isinstance(vector_store_state, dict):
+            indexed_ids = set(vector_store_state.get("file_ids", []) or [])
+
+        # Validate existing vector store if present.
+        if vector_store_id:
+            try:
+                await self._openai_api_request_json(
+                    "GET",
+                    f"/vector_stores/{vector_store_id}",
+                    api_key=valves.API_KEY,
+                    base_url=valves.BASE_URL,
+                    beta_assistants_v2=True,
+                )
+            except Exception:
+                vector_store_id = ""
+                indexed_ids.clear()
+                if isinstance(vector_store_state, dict):
+                    vector_store_state.clear()
+
+        if not vector_store_id:
+            create_body: dict[str, Any] = {"name": valves.VECTOR_STORE_NAME}
+            if valves.VECTOR_STORE_EXPIRES_AFTER_DAYS is not None:
+                create_body["expires_after"] = {
+                    "anchor": "last_active_at",
+                    "days": int(valves.VECTOR_STORE_EXPIRES_AFTER_DAYS),
+                }
+
+            if event_emitter is not None:
+                await self._emit_status(event_emitter, "Creating OpenAI vector store…", hidden=True)
+
+            vs = await self._openai_api_request_json(
+                "POST",
+                "/vector_stores",
+                api_key=valves.API_KEY,
+                base_url=valves.BASE_URL,
+                json_body=create_body,
+                beta_assistants_v2=True,
+            )
+            vector_store_id = (vs.get("id") or "").strip()
+            if not vector_store_id:
+                raise ValueError("OpenAI vector store create returned no id")
+
+            if isinstance(vector_store_state, dict):
+                vector_store_state["id"] = vector_store_id
+                vector_store_state["created_at"] = int(time.time())
+                vector_store_state["file_ids"] = []
+
+        new_ids = [fid for fid in openai_file_ids if fid and fid not in indexed_ids]
+        if new_ids:
+            if event_emitter is not None:
+                await self._emit_status(event_emitter, "Indexing files for OpenAI file search…", hidden=True)
+
+            await self._openai_add_files_to_vector_store(vector_store_id, new_ids, valves=valves)
+
+            indexed_ids.update(new_ids)
+            if isinstance(vector_store_state, dict):
+                vector_store_state["file_ids"] = sorted(indexed_ids)
+
+        if chat_model is not None and chat_id and vector_store_state is not None:
+            Chats.update_chat_by_id(chat_id, chat_model.chat)
+
+        return vector_store_id
+
+    async def _openai_add_files_to_vector_store(
+        self,
+        vector_store_id: str,
+        openai_file_ids: list[str],
+        *,
+        valves: "Pipe.Valves",
+    ) -> None:
+        """Add OpenAI files to a vector store and wait for indexing."""
+        # Prefer file batches when available.
+        try:
+            batch = await self._openai_api_request_json(
+                "POST",
+                f"/vector_stores/{vector_store_id}/file_batches",
+                api_key=valves.API_KEY,
+                base_url=valves.BASE_URL,
+                json_body={"file_ids": openai_file_ids},
+                beta_assistants_v2=True,
+            )
+            batch_id = (batch.get("id") or "").strip()
+            if batch_id:
+                await self._openai_wait_for_vector_store_file_batch(
+                    vector_store_id,
+                    batch_id,
+                    valves=valves,
+                )
+                return
+        except Exception:
+            pass
+
+        # Fallback: add files one-by-one (best-effort).
+        vector_store_file_ids: list[str] = []
+        for fid in openai_file_ids:
+            vs_file = await self._openai_api_request_json(
+                "POST",
+                f"/vector_stores/{vector_store_id}/files",
+                api_key=valves.API_KEY,
+                base_url=valves.BASE_URL,
+                json_body={"file_id": fid},
+                beta_assistants_v2=True,
+            )
+            vs_file_id = (vs_file.get("id") or "").strip()
+            if vs_file_id:
+                vector_store_file_ids.append(vs_file_id)
+
+        for vs_file_id in vector_store_file_ids:
+            await self._openai_wait_for_vector_store_file(vector_store_id, vs_file_id, valves=valves)
+
+    async def _openai_wait_for_vector_store_file_batch(
+        self,
+        vector_store_id: str,
+        batch_id: str,
+        *,
+        valves: "Pipe.Valves",
+    ) -> None:
+        deadline = time.monotonic() + float(valves.VECTOR_STORE_TIMEOUT_S)
+        while True:
+            batch = await self._openai_api_request_json(
+                "GET",
+                f"/vector_stores/{vector_store_id}/file_batches/{batch_id}",
+                api_key=valves.API_KEY,
+                base_url=valves.BASE_URL,
+                beta_assistants_v2=True,
+            )
+            status = (batch.get("status") or "").lower()
+            if status in {"completed", "failed", "cancelled", "canceled", "expired"}:
+                if status != "completed":
+                    raise RuntimeError(f"Vector store file batch status: {status}")
+                return
+
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for vector store indexing")
+
+            await asyncio.sleep(float(valves.VECTOR_STORE_POLL_INTERVAL_S))
+
+    async def _openai_wait_for_vector_store_file(
+        self,
+        vector_store_id: str,
+        vector_store_file_id: str,
+        *,
+        valves: "Pipe.Valves",
+    ) -> None:
+        deadline = time.monotonic() + float(valves.VECTOR_STORE_TIMEOUT_S)
+        while True:
+            vs_file = await self._openai_api_request_json(
+                "GET",
+                f"/vector_stores/{vector_store_id}/files/{vector_store_file_id}",
+                api_key=valves.API_KEY,
+                base_url=valves.BASE_URL,
+                beta_assistants_v2=True,
+            )
+            status = (vs_file.get("status") or "").lower()
+            if status in {"completed", "failed", "cancelled", "canceled", "expired"}:
+                if status != "completed":
+                    raise RuntimeError(f"Vector store file status: {status}")
+                return
+
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for vector store indexing")
+
+            await asyncio.sleep(float(valves.VECTOR_STORE_POLL_INTERVAL_S))
+
     # 4.6 Tool Execution Logic
     @staticmethod
     async def _execute_function_calls(

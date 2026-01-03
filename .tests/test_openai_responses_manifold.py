@@ -1,3 +1,4 @@
+import asyncio
 import json
 from dataclasses import dataclass
 
@@ -232,6 +233,112 @@ def test_transform_tools_dedup_and_unknown():
     assert names == {"add", "foo"}
     func = next(t for t in out if t.get("type") == "function")
     assert func["parameters"].get("b") == 1
+
+
+def test_collect_openwebui_file_attachments(monkeypatch, tmp_path):
+    pipe = mod.Pipe()
+
+    local_file = tmp_path / "doc.txt"
+    local_file.write_text("hi", encoding="utf-8")
+
+    dummy = mod.Files.DummyFile(  # type: ignore[attr-defined]
+        id="f1",
+        user_id="u1",
+        filename="doc.txt",
+        path=str(local_file),
+        meta={"content_type": "text/plain", "size": local_file.stat().st_size},
+    )
+
+    monkeypatch.setattr(mod.Files, "get_file_by_id_and_user_id", lambda fid, uid: dummy)
+    monkeypatch.setattr(mod.Storage, "get_file", lambda p: p)
+
+    out = pipe._collect_openwebui_file_attachments([{"id": "f1", "name": "doc.txt"}], user_id="u1")
+    assert len(out) == 1
+    assert out[0].id == "f1"
+    assert out[0].filename == "doc.txt"
+    assert out[0].local_path == str(local_file)
+    assert out[0].content_type == "text/plain"
+
+
+def test_builtin_file_tools_injected(monkeypatch):
+    pipe = mod.Pipe()
+    pipe.valves = pipe.Valves(
+        ALLOW_OPENAI_FILE_UPLOADS=True,
+        ENABLE_CODE_INTERPRETER_TOOL=True,
+        ENABLE_FILE_SEARCH_TOOL=True,
+    )
+
+    attachment = mod._OpenWebUIFileAttachment(
+        id="f1",
+        filename="doc.txt",
+        local_path="/tmp/doc.txt",
+        size_bytes=2,
+        content_type="text/plain",
+    )
+    monkeypatch.setattr(pipe, "_collect_openwebui_file_attachments", lambda raw, user_id: [attachment])
+
+    async def fake_uploads(*args, **kwargs):
+        return (
+            ["file-abc"],
+            {"file-abc": {"openwebui_file_id": "f1", "filename": "doc.txt"}},
+        )
+
+    async def fake_vs(*args, **kwargs):
+        return "vs-123"
+
+    monkeypatch.setattr(pipe, "_ensure_openai_file_uploads", fake_uploads)
+    monkeypatch.setattr(pipe, "_ensure_vector_store_indexed", fake_vs)
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_streaming_loop(
+        body, valves, event_emitter, metadata, tools, *, openai_file_citations=None
+    ):
+        captured["body"] = body
+        captured["openai_file_citations"] = openai_file_citations
+        return "ok"
+
+    monkeypatch.setattr(pipe, "_run_streaming_loop", fake_run_streaming_loop)
+
+    async def emitter(_event):
+        return None
+
+    body = {
+        "model": "gpt-4o",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_file", "file_id": "f1"},
+                    {"type": "text", "text": "analyze"},
+                ],
+            }
+        ],
+        "stream": True,
+    }
+
+    result = asyncio.run(
+        pipe.pipe(
+            body,
+            __user__={"id": "u1"},
+            __request__=None,  # unused by this code path
+            __event_emitter__=emitter,
+            __metadata__={"model": {"id": "openai_responses.gpt-4o"}, "chat_id": None},
+            __tools__=None,
+            __files__=[{"id": "f1", "name": "doc.txt"}],
+        )
+    )
+    assert result == "ok"
+
+    sent = captured["body"]
+    assert isinstance(sent, mod.ResponsesBody)
+    assert {"type": "code_interpreter"} in (sent.tools or [])
+    assert {"type": "file_search"} in (sent.tools or [])
+    assert sent.tool_resources["code_interpreter"]["file_ids"] == ["file-abc"]
+    assert sent.tool_resources["file_search"]["vector_store_ids"] == ["vs-123"]
+
+    # input_file rewritten from Open WebUI id -> OpenAI file id
+    assert sent.input[0]["content"][0]["file_id"] == "file-abc"
 
 
 @pytest.mark.parametrize(
