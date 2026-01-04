@@ -1,7 +1,7 @@
 """
 title: AskUserQuestion
 id: AskUserQuestion
-version: 0.1.9
+version: 0.1.10
 description: Prompt the user with a structured form (checkboxes, selects, text) and return the answers to the model.
 license: MIT
 """
@@ -15,10 +15,12 @@ import secrets
 import time
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class FormField(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(
         ...,
         description="Stable key used in the returned values object (e.g. 'destination').",
@@ -64,7 +66,7 @@ class FormField(BaseModel):
         description="Helper text displayed under the field.",
     )
 
-    default: Any | None = Field(
+    default: str | float | int | bool | list[str] | None = Field(
         default=None,
         description="Default value (type depends on field type).",
     )
@@ -149,6 +151,8 @@ class FormField(BaseModel):
 
 
 class FormSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     title: str = Field(
         default="Input required",
         description="Modal title.",
@@ -725,7 +729,7 @@ class Tools:
 
     async def AskUserQuestion(
         self,
-        schema: dict[str, Any],
+        schema: FormSchema,
         timeout_seconds: float = 1800.0,
         poll_interval_ms: int = 500,
         __event_call__=None,

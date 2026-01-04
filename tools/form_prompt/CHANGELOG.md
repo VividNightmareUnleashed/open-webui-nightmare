@@ -1,3 +1,6 @@
+## [0.1.10] - 2026-01-04
+- Make the `schema` argument strict-schema compatible for OpenAI Responses native tool calling (prevents `invalid_function_parameters` 400s).
+
 ## [0.1.6] - 2026-01-04
 - Adjust cancel `refusal` message wording to be more explicit and consistent.
 

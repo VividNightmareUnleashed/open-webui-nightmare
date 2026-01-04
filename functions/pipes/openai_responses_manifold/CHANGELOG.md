@@ -5,6 +5,13 @@ All notable changes to the OpenAI Responses Manifold pipeline are documented in 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.31] - 2026-01-04
+- Normalized Open WebUI native tool specs and `tool_choice` to the Responses API format to prevent 400 errors when `function_calling=native`.
+- Improved strict tool schema handling to avoid mutating author-provided schemas while still enforcing `additionalProperties=false`.
+- Added model-family alias normalization for feature gating (`gpt-5-chat-latest` → `gpt-5`, `chatgpt-4o-latest` → `gpt-4o`).
+- Added a `REASONING_EFFORT` valve to set a default reasoning effort for reasoning models (without overwriting explicit request/alias effort).
+- Surface full OpenAI error payloads on `/responses` HTTP failures for easier debugging.
+
 ## [0.8.28] - 2025-08-21
 - Resolved compatibility with Open WebUI v0.6.23 by awaiting `__tools__` when
   it is provided as a coroutine.

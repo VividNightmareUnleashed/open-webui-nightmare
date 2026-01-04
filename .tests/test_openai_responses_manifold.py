@@ -103,6 +103,69 @@ def test_tool_transforms_and_mcp():
     ]
 
 
+def test_normalize_model_family_aliases():
+    assert mod.normalize_model_family("o3-2025-04-16") == "o3"
+    assert mod.normalize_model_family("gpt-5-chat-latest") == "gpt-5"
+    assert mod.normalize_model_family("chatgpt-4o-latest") == "gpt-4o"
+
+
+def test_native_tool_wrappers_converted(monkeypatch):
+    pipe = mod.Pipe()
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_streaming_loop(
+        body, valves, event_emitter, metadata, tools, *, openai_file_citations=None
+    ):
+        captured["body"] = body
+        return "ok"
+
+    monkeypatch.setattr(pipe, "_run_streaming_loop", fake_run_streaming_loop)
+
+    async def emitter(_event):
+        return None
+
+    body = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "AskUserQuestion",
+                    "description": "x",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"q": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "AskUserQuestion"}},
+    }
+
+    result = asyncio.run(
+        pipe.pipe(
+            body,
+            __user__={"id": "u1"},
+            __request__=None,  # unused by this code path
+            __event_emitter__=emitter,
+            __metadata__={"model": {"id": "openai_responses.gpt-5.2"}, "chat_id": None},
+            __tools__=None,
+        )
+    )
+    assert result == "ok"
+
+    sent = captured["body"]
+    assert isinstance(sent, mod.ResponsesBody)
+    tool = next(t for t in (sent.tools or []) if t.get("type") == "function")
+    assert tool["name"] == "AskUserQuestion"
+    assert tool["strict"] is True
+    assert tool["parameters"]["additionalProperties"] is False
+    assert sent.tool_choice == {"type": "function", "name": "AskUserQuestion"}
+
+
 @pytest.mark.parametrize("item_type", ["", "a", "bad!", "x" * 31])
 def test_create_marker_rejects_bad_types(item_type):
     """Ensure invalid item_type values raise."""

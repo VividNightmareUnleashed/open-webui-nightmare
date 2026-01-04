@@ -6,7 +6,7 @@ author_url: https://github.com/jrkropp
 git_url: https://github.com/jrkropp/open-webui-developer-toolkit/blob/main/functions/pipes/openai_responses_manifold/openai_responses_manifold.py
 description: Brings OpenAI Response API support to Open WebUI, enabling features not possible via Completions API.
 required_open_webui_version: 0.6.3
-version: 0.8.30
+version: 0.8.31
 license: MIT
 """
 
@@ -65,6 +65,19 @@ FEATURE_SUPPORT = {
     # NOTE: Deep Research models are not yet supported in pipe.  Work in-progress.
     "deep_research": {"o3-deep-research", "o4-mini-deep-research"}, # OpenAI's deep research models.
 }
+
+MODEL_FAMILY_ALIASES: dict[str, str] = {
+    # Map "latest" aliases to their canonical feature families.
+    "gpt-5-chat-latest": "gpt-5",
+    "chatgpt-4o-latest": "gpt-4o",
+}
+
+
+def normalize_model_family(model: str) -> str:
+    """Return the canonical model family name used for feature gating."""
+    base = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", (model or "").strip())
+    return MODEL_FAMILY_ALIASES.get(base, base)
+
 
 DETAILS_RE = re.compile(
     r"<details\b[^>]*>.*?</details>|!\[.*?]\(.*?\)",
@@ -157,7 +170,7 @@ class ResponsesBody(BaseModel):
     reasoning: Optional[Dict[str, Any]] = None    # {"effort":"high", ...}
     parallel_tool_calls: Optional[bool] = True
     user: Optional[str] = None                # user ID for the request.  Recommended to improve caching hits.
-    tool_choice: Optional[Dict[str, Any]] = None
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
     tools: Optional[List[Dict[str, Any]]] = None
     tool_resources: Optional[Dict[str, Any]] = None
     include: Optional[List[str]] = None           # extra output keys
@@ -225,16 +238,63 @@ class ResponsesBody(BaseModel):
 
         # 2. strict-mode hardening for the bits we just converted ----------
         if strict:
+            def _close_object_schemas(node: Any) -> None:
+                """Recursively enforce OpenAI strict JSON-schema requirements."""
+                if isinstance(node, list):
+                    for item in node:
+                        _close_object_schemas(item)
+                    return
+
+                if not isinstance(node, dict):
+                    return
+
+                node_type = node.get("type")
+                is_object = node_type == "object" or (
+                    isinstance(node_type, list) and "object" in node_type
+                ) or "properties" in node
+
+                if is_object:
+                    node.setdefault("type", "object")
+                    props = node.get("properties")
+                    if isinstance(props, dict):
+                        node.setdefault("required", list(props))
+                    node["additionalProperties"] = False
+
+                # Traverse common schema containers.
+                for key in (
+                    "properties",
+                    "items",
+                    "prefixItems",
+                    "anyOf",
+                    "oneOf",
+                    "allOf",
+                    "$defs",
+                    "definitions",
+                    "dependentSchemas",
+                    "not",
+                    "if",
+                    "then",
+                    "else",
+                ):
+                    child = node.get(key)
+                    if isinstance(child, dict):
+                        _close_object_schemas(child)
+                    elif isinstance(child, list):
+                        for item in child:
+                            _close_object_schemas(item)
+
             for tool in converted:
-                params = tool.setdefault("parameters", {})
-                props  = params.setdefault("properties", {})
-                params["required"] = list(props)
-                params["additionalProperties"] = False
-                for schema in props.values():
-                    t = schema.get("type")
-                    schema["type"] = [t, "null"] if isinstance(t, str) else (
-                        t + ["null"] if isinstance(t, list) and "null" not in t else t
-                    )
+                params = tool.get("parameters")
+                if not isinstance(params, dict):
+                    params = {}
+                    tool["parameters"] = params
+
+                # Tools must use an object schema at the root.
+                params.setdefault("type", "object")
+                if not isinstance(params.get("properties"), dict):
+                    params["properties"] = {}
+
+                _close_object_schemas(params)
                 tool["strict"] = True
 
         # 3. deduplicate ---------------------------------------------------
@@ -773,8 +833,8 @@ class Pipe:
                 valves,
             )
 
-        # Normalize to family-level model name (e.g., 'o3' from 'o3-2025-04-16') to be used for feature detection.
-        model_family = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", responses_body.model)
+        # Normalize to family-level model name for feature detection.
+        model_family = normalize_model_family(responses_body.model)
 
         # Apply REASONING_EFFORT to reasoning models unless already set by the request / alias.
         if model_family in FEATURE_SUPPORT["reasoning"] and valves.REASONING_EFFORT:
@@ -786,13 +846,40 @@ class Pipe:
         if inspect.isawaitable(__tools__):
             __tools__ = await __tools__
 
-        # Add Open WebUI Tools (if any) to the ResponsesBody.
-        # TODO: Also detect body['tools'] and merge them with __tools__.  This would allow users to pass tools in the request body from filters, etc.
-        if __tools__ and model_family in FEATURE_SUPPORT["function_calling"]:
+        # Normalize tool specs for the Responses API.
+        #
+        # When Open WebUI "native function calling" is enabled, middleware injects
+        # Chat-Completions wrappers into `body["tools"]`:
+        #   {"type":"function","function": {...}}
+        # The Responses API expects flattened function tools:
+        #   {"type":"function","name": "...", "parameters": {...}}
+        #
+        # We merge any existing body tools with Open WebUI `__tools__` and
+        # canonicalize everything to Responses format.
+        merged_tools: list[dict[str, Any]] = []
+        if isinstance(responses_body.tools, list):
+            merged_tools.extend([t for t in responses_body.tools if isinstance(t, dict)])
+        if isinstance(__tools__, dict):
+            merged_tools.extend([t for t in __tools__.values() if isinstance(t, dict)])
+        elif isinstance(__tools__, list):
+            merged_tools.extend([t for t in __tools__ if isinstance(t, dict)])
+
+        if merged_tools:
             responses_body.tools = ResponsesBody.transform_tools(
-                tools=__tools__,
+                tools=merged_tools,
                 strict=True,
             )
+
+        # Normalize tool_choice from Chat Completions ("function": {"name": ...})
+        # to Responses ("name": ...).
+        if isinstance(responses_body.tool_choice, dict):
+            tc_type = responses_body.tool_choice.get("type")
+            if tc_type == "function" and isinstance(responses_body.tool_choice.get("function"), dict):
+                fn = responses_body.tool_choice["function"]
+                responses_body.tool_choice = {
+                    "type": "function",
+                    "name": fn.get("name", ""),
+                }
 
         # Add web_search tool only if supported, enabled, and effort != minimal
         # Noted that web search doesn't seem to work when effort = minimal.
@@ -1039,7 +1126,7 @@ class Pipe:
 
             if verbosity_value:
                 # Check model support
-                model_family = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", responses_body.model)
+                model_family = normalize_model_family(responses_body.model)
                 if model_family in FEATURE_SUPPORT["verbosity"]:
                     # Set/overwrite verbosity (do NOT remove the stub message)
                     current_text_params = dict(getattr(responses_body, "text", {}) or {})
@@ -1097,7 +1184,7 @@ class Pipe:
 
         # Emit initial "thinking" block:
         # If reasoning model, write "Thinking…" to the expandable status emitter.
-        model_family = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", body.model)
+        model_family = normalize_model_family(body.model)
         if model_family in FEATURE_SUPPORT["reasoning"]:
             assistant_message = await status_indicator.add(
                 assistant_message,
@@ -1445,7 +1532,7 @@ class Pipe:
         status_indicator = ExpandableStatusIndicator(event_emitter)
         status_indicator._done = False
 
-        model_family = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", body.model)
+        model_family = normalize_model_family(body.model)
         if model_family in FEATURE_SUPPORT["reasoning"]:
             assistant_message = await status_indicator.add(
                 assistant_message,
@@ -1673,7 +1760,24 @@ class Pipe:
 
         buf = bytearray()
         async with self.session.post(url, json=request_body, headers=headers) as resp:
-            resp.raise_for_status()
+            if resp.status >= 400:
+                error_payload: object
+                try:
+                    error_payload = await resp.json()
+                except Exception:
+                    error_payload = await resp.text()
+
+                rendered_error = (
+                    json.dumps(error_payload, ensure_ascii=False)
+                    if isinstance(error_payload, (dict, list))
+                    else str(error_payload)
+                )
+                self.logger.error(
+                    "OpenAI Responses API error (%s): %s",
+                    resp.status,
+                    rendered_error,
+                )
+                raise RuntimeError(f"OpenAI Responses API error ({resp.status}): {rendered_error}")
 
             async for chunk in resp.content.iter_chunked(4096):
                 buf.extend(chunk)
@@ -1719,7 +1823,25 @@ class Pipe:
         url = base_url.rstrip("/") + "/responses"
 
         async with self.session.post(url, json=request_params, headers=headers) as resp:
-            resp.raise_for_status()
+            if resp.status >= 400:
+                error_payload: object
+                try:
+                    error_payload = await resp.json()
+                except Exception:
+                    error_payload = await resp.text()
+
+                rendered_error = (
+                    json.dumps(error_payload, ensure_ascii=False)
+                    if isinstance(error_payload, (dict, list))
+                    else str(error_payload)
+                )
+                self.logger.error(
+                    "OpenAI Responses API error (%s): %s",
+                    resp.status,
+                    rendered_error,
+                )
+                raise RuntimeError(f"OpenAI Responses API error ({resp.status}): {rendered_error}")
+
             return await resp.json()
     
     async def _get_or_init_http_session(self) -> aiohttp.ClientSession:
