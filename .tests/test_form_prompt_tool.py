@@ -7,14 +7,15 @@ from tools.form_prompt import form_prompt as mod
 def test_prompt_form_requires_event_call():
     tool = mod.Tools()
     out = asyncio.run(
-        tool.prompt_form(
+        tool.AskUserQuestion(
             schema={
                 "title": "Test",
                 "fields": [{"name": "x", "label": "X", "type": "text"}],
             }
         )
     )
-    assert out["error"].startswith("Missing __event_call__")
+    assert isinstance(out, str)
+    assert "WebSocket event calls" in out
 
 
 def test_prompt_form_validates_schema():
@@ -22,7 +23,7 @@ def test_prompt_form_validates_schema():
         return event
 
     tool = mod.Tools()
-    out = asyncio.run(tool.prompt_form(schema={"title": "Bad", "fields": []}, __event_call__=fake_call))
+    out = asyncio.run(tool.AskUserQuestion(schema={"title": "Bad", "fields": []}, __event_call__=fake_call))
     assert "Invalid schema" in out["error"]
 
 
@@ -39,7 +40,7 @@ def test_prompt_form_calls_execute_and_returns_result():
 
     tool = mod.Tools()
     out = asyncio.run(
-        tool.prompt_form(
+        tool.AskUserQuestion(
             schema={
                 "title": "Trip Planner",
                 "fields": [
@@ -68,3 +69,26 @@ def test_prompt_form_calls_execute_and_returns_result():
     assert seen_status[0]["data"]["done"] is False
     assert seen_status[1]["data"]["done"] is True
 
+
+def test_prompt_form_accepts_common_llm_schema_variants():
+    async def fake_call(event: dict):
+        return event
+
+    tool = mod.Tools()
+    out = asyncio.run(
+        tool.AskUserQuestion(
+            schema={
+                "title": "Test",
+                "fields": [
+                    {
+                        "key": "level",
+                        "type": "radio",
+                        "options": [{"label": "Expert", "value": "Expert"}],
+                    }
+                ],
+            },
+            __event_call__=fake_call,
+        )
+    )
+
+    assert out["type"] == "execute"

@@ -3,21 +3,22 @@
 Interactive, **structured user input** for Open WebUI tool calling.
 
 This tool uses Open WebUI’s built-in `__event_call__` + `execute` event to render a modal form in the browser (text inputs, selects, checkboxes, etc.) and returns the filled values to the model as JSON.
+The injected modal uses the same Tailwind classnames as Open WebUI’s native modal/input-variables UI, so it blends in visually.
 
 ## Install
 
 1. Open WebUI → **Admin Panel** → **Tools**
 2. Create a new tool with:
-   - **id**: `form_prompt`
+   - **id**: `AskUserQuestion`
    - paste the contents of `tools/form_prompt/form_prompt.py`
 
 ## How To Use
 
-Enable the tool for your chat, then ask the model to call `prompt_form`.
+Enable the tool for your chat, then ask the model to call `AskUserQuestion`.
 
 Example prompt you can give the model:
 
-> Use the `prompt_form` tool to collect the missing details. Use a checkbox for optional add-ons, and a select for pace.
+> Use the `AskUserQuestion` tool to collect the missing details. Use a checkbox for optional add-ons, and a select for pace.
 
 Example tool call schema:
 
@@ -37,6 +38,10 @@ Example tool call schema:
 }
 ```
 
+Notes:
+- Fields should use `name`, but `key` is also accepted.
+- For `select` / `multiselect`, `options` should be an array of strings; `{ "label": "...", "value": "..." }` objects are accepted and coerced to strings.
+
 Return value (to the model):
 
 ```json
@@ -55,4 +60,3 @@ Return value (to the model):
 ## Safety Notes
 
 - This tool relies on Open WebUI’s **client-side `execute` event** (JavaScript execution in the browser). Treat it as a privileged capability and only enable it in environments you trust.
-

@@ -1,7 +1,7 @@
 """
-title: Form Prompt
-id: form_prompt
-version: 0.1.1
+title: AskUserQuestion
+id: AskUserQuestion
+version: 0.1.4
 description: Prompt the user with a structured form (checkboxes, selects, text) and return the answers to the model.
 license: MIT
 """
@@ -12,16 +12,17 @@ import base64
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 
 class FormField(BaseModel):
     name: str = Field(
         ...,
         description="Stable key used in the returned values object (e.g. 'destination').",
+        validation_alias=AliasChoices("name", "key"),
     )
     label: str = Field(
-        ...,
+        default="",
         description="Human-readable label shown to the user.",
     )
     type: Literal[
@@ -78,6 +79,71 @@ class FormField(BaseModel):
         description="Step for 'number'.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _fill_defaults(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        patched = dict(data)
+
+        raw_name = patched.get("name") or patched.get("key")
+        if not patched.get("label") and raw_name:
+            patched["label"] = str(raw_name).replace("_", " ").strip().title()
+
+        return patched
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def _normalize_type(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+
+        normalized = value.strip().lower()
+        aliases = {
+            "radio": "select",
+            "dropdown": "select",
+            "combo": "select",
+            "multi_select": "multiselect",
+            "multi-select": "multiselect",
+            "multi choice": "multiselect",
+            "boolean": "checkbox",
+            "bool": "checkbox",
+            "string": "text",
+            "integer": "number",
+            "int": "number",
+        }
+        return aliases.get(normalized, normalized)
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def _coerce_options(cls, value: Any) -> Any:
+        if value is None:
+            return None
+
+        if isinstance(value, dict):
+            value = list(value.values())
+
+        if not isinstance(value, list):
+            return value
+
+        out: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                out.append(item)
+                continue
+            if isinstance(item, dict):
+                raw = item.get("value") or item.get("label") or item.get("name") or item.get("title")
+                if raw is not None:
+                    out.append(str(raw))
+                else:
+                    out.append(json.dumps(item, ensure_ascii=True, separators=(",", ":")))
+                continue
+
+            out.append(str(item))
+
+        return out
+
 
 class FormSchema(BaseModel):
     title: str = Field(
@@ -117,9 +183,10 @@ def _build_execute_code(schema: FormSchema) -> str:
     return f"""
 const __owui_schema = JSON.parse(atob("{schema_b64}"));
 
-const __owui_themeIsDark = document.documentElement.classList.contains('dark');
-const __owui_prevOverflow = document.body.style.overflow;
-document.body.style.overflow = 'hidden';
+	const __owui_prevOverflow = document.body.style.overflow;
+	document.body.style.overflow = 'hidden';
+
+	let __owui_requestCancel = () => {{}};
 
 function __owui_el(tag, attrs, children) {{
   const el = document.createElement(tag);
@@ -198,241 +265,204 @@ if (__owui_fields.length === 0) {{
   return {{ error: 'Form schema has no fields.' }};
 }}
 
-const __owui_overlay = __owui_el('div', {{
-  style: {{
-    position: 'fixed',
-    inset: '0',
-    background: 'rgba(0,0,0,0.6)',
-    zIndex: '2147483647',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: '16px',
-  }},
-}}, []);
+	const __owui_overlay = __owui_el('div', {{
+	  className: 'modal fixed top-0 right-0 left-0 bottom-0 bg-black/30 dark:bg-black/60 w-full h-screen max-h-[100dvh] p-3 flex justify-center z-9999 overflow-y-auto overscroll-contain',
+	  role: 'dialog',
+	  'aria-modal': 'true',
+	}}, []);
+	
+	const __owui_modal = __owui_el('div', {{
+	  className: 'm-auto max-w-full w-[42rem] mx-2 shadow-3xl min-h-fit scrollbar-hidden bg-white/95 dark:bg-gray-900/95 backdrop-blur-sm rounded-4xl border border-white dark:border-gray-850',
+	  onmousedown: (e) => {{
+	    e.stopPropagation();
+	  }},
+	}}, []);
+	
+	const __owui_header = __owui_el('div', {{ className: 'flex justify-between dark:text-gray-300 px-5 pt-4 pb-2' }}, [
+	  __owui_el('div', {{ className: 'text-lg font-medium self-center' }}, [__owui_title]),
+	  __owui_el(
+	    'button',
+	    {{
+	      type: 'button',
+	      className: 'self-center text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200',
+	      onclick: (e) => {{
+	        e.preventDefault();
+	        __owui_requestCancel();
+	      }},
+	    }},
+	    [__owui_el('span', {{ className: 'text-xl leading-none' }}, ['×'])]
+	  ),
+	]);
+	
+	const __owui_descriptionEl = __owui_description
+	  ? __owui_el('div', {{ className: 'px-5 pb-2 text-sm text-gray-500 dark:text-gray-400' }}, [__owui_description])
+	  : null;
+	
+	const __owui_error = __owui_el('div', {{
+	  className: 'hidden mx-5 mt-2 px-4 py-2 rounded-lg bg-red-50 text-red-700 dark:bg-red-950/40 dark:text-red-200 text-sm',
+	}}, []);
+	
+	const __owui_body = __owui_el('div', {{ className: 'flex flex-col md:flex-row w-full px-5 pb-4 md:space-x-4 dark:text-gray-200' }}, []);
+	const __owui_bodyInner = __owui_el('div', {{ className: 'flex flex-col w-full sm:flex-row sm:justify-center sm:space-x-6' }}, []);
+	
+	const __owui_form = __owui_el('form', {{
+	  className: 'flex flex-col w-full',
+	  onsubmit: (e) => {{
+	    e.preventDefault();
+	  }},
+	}}, []);
+	
+	const __owui_fieldsWrap = __owui_el('div', {{ className: 'px-1' }}, []);
+	const __owui_fieldsEl = __owui_el('div', {{ className: 'flex flex-col gap-1' }}, []);
+	__owui_fieldsWrap.appendChild(__owui_fieldsEl);
+	__owui_form.appendChild(__owui_fieldsWrap);
+	
+	const __owui_buttons = __owui_el('div', {{ className: 'flex justify-end pt-3 text-sm font-medium gap-2' }}, []);
+	
+	const __owui_cancelBtn = __owui_el('button', {{
+	  className: 'px-3.5 py-1.5 text-sm font-medium bg-white hover:bg-gray-100 text-black dark:bg-black dark:text-white dark:hover:bg-gray-900 transition rounded-full',
+	  type: 'button',
+	}}, [__owui_cancelLabel]);
+	
+	const __owui_submitBtn = __owui_el('button', {{
+	  className: 'px-3.5 py-1.5 text-sm font-medium bg-black hover:bg-gray-900 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 transition rounded-full',
+	  type: 'submit',
+	}}, [__owui_submitLabel]);
+	
+	__owui_buttons.appendChild(__owui_cancelBtn);
+	__owui_buttons.appendChild(__owui_submitBtn);
+	__owui_form.appendChild(__owui_buttons);
+	
+	__owui_bodyInner.appendChild(__owui_form);
+	__owui_body.appendChild(__owui_bodyInner);
+	
+	__owui_modal.appendChild(__owui_header);
+	if (__owui_descriptionEl) __owui_modal.appendChild(__owui_descriptionEl);
+	__owui_modal.appendChild(__owui_error);
+	__owui_modal.appendChild(__owui_body);
+	__owui_overlay.appendChild(__owui_modal);
+	document.body.appendChild(__owui_overlay);
+	
+	__owui_requestCancel = () => {{
+	  __owui_cancelBtn.click();
+	}};
+	
+	const __owui_inputsByName = new Map();
 
-const __owui_modal = __owui_el('div', {{
-  style: {{
-    width: '100%',
-    maxWidth: '720px',
-    maxHeight: '90vh',
-    overflow: 'auto',
-    borderRadius: '24px',
-    padding: '20px 20px 16px 20px',
-    background: __owui_themeIsDark ? 'rgba(17,24,39,0.97)' : 'rgba(255,255,255,0.97)',
-    color: __owui_themeIsDark ? '#e5e7eb' : '#111827',
-    border: __owui_themeIsDark ? '1px solid rgba(55,65,81,0.7)' : '1px solid rgba(229,231,235,0.9)',
-    boxShadow: '0 24px 70px rgba(0,0,0,0.35)',
-    fontFamily: 'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Noto Sans, Apple Color Emoji, Segoe UI Emoji',
-  }},
-}}, []);
+	const __owui_inputClass =
+	  'w-full rounded-lg py-2 px-4 text-sm dark:text-gray-300 dark:bg-gray-850 outline-hidden border border-gray-100/30 dark:border-gray-850/30';
+	const __owui_checkboxClass = 'size-3.5 rounded cursor-pointer border border-gray-200 dark:border-gray-700';
+	const __owui_helpClass = 'text-xs text-gray-500 dark:text-gray-400';
+	
+	function __owui_renderField(field, idx) {{
+	  const wrapper = __owui_el('div', {{ className: 'py-0.5 w-full justify-between' }}, []);
+	
+	  const labelEl = __owui_el('div', {{ className: 'self-center text-xs font-medium' }}, []);
+	  labelEl.appendChild(document.createTextNode(field.label || field.name));
+	  if (field.required) {{
+	    labelEl.appendChild(__owui_el('span', {{ className: 'text-gray-500' }}, [' *required']));
+	  }}
+	
+	  const labelRow = __owui_el('div', {{ className: 'flex w-full justify-between mb-1.5' }}, [labelEl]);
+	  wrapper.appendChild(labelRow);
+	
+	  const inputId = 'input-variable-' + String(idx);
+	  let inputEl = null;
+	
+	  if (field.type === 'textarea') {{
+	    inputEl = __owui_el('textarea', {{
+	      id: inputId,
+	      className: __owui_inputClass + ' min-h-[96px] resize-y',
+	      placeholder: field.placeholder || '',
+	      rows: '4',
+	      autocomplete: 'off',
+	      required: field.required ? 'required' : null,
+	    }}, []);
+	    if (field.default != null) inputEl.value = String(field.default);
+	  }} else if (field.type === 'select' || field.type === 'multiselect') {{
+	    inputEl = __owui_el('select', {{
+	      id: inputId,
+	      className: __owui_inputClass,
+	      multiple: field.type === 'multiselect' ? 'multiple' : null,
+	      size: field.type === 'multiselect' ? String(Math.min(6, Math.max(3, field.options.length || 3))) : null,
+	      required: field.required ? 'required' : null,
+	    }}, []);
+	
+	    if (field.type === 'select' && field.placeholder) {{
+	      const opt = __owui_el('option', {{ value: '' }}, [field.placeholder]);
+	      opt.disabled = true;
+	      opt.selected = field.default == null || String(field.default) === '';
+	      inputEl.appendChild(opt);
+	    }}
+	
+	    for (const opt of field.options) {{
+	      inputEl.appendChild(__owui_el('option', {{ value: opt }}, [opt]));
+	    }}
+	
+	    const def = field.default;
+	    if (field.type === 'multiselect' && Array.isArray(def)) {{
+	      for (const optionEl of Array.from(inputEl.options)) {{
+	        optionEl.selected = def.map(String).includes(optionEl.value);
+	      }}
+	    }} else if (field.type === 'select' && def != null) {{
+	      inputEl.value = String(def);
+	    }}
+	  }} else if (field.type === 'checkbox') {{
+	    inputEl = __owui_el('input', {{
+	      id: inputId,
+	      type: 'checkbox',
+	      className: __owui_checkboxClass,
+	    }}, []);
+	    inputEl.checked = Boolean(field.default);
+	  }} else {{
+	    const allowed = new Set(['text','email','url','date','time','number']);
+	    const t = allowed.has(field.type) ? field.type : 'text';
+	    inputEl = __owui_el('input', {{
+	      id: inputId,
+	      type: t,
+	      className: __owui_inputClass,
+	      placeholder: field.placeholder || '',
+	      autocomplete: 'off',
+	      required: field.required ? 'required' : null,
+	    }}, []);
+	    if (t === 'number') {{
+	      if (field.min != null && !Number.isNaN(field.min)) inputEl.min = String(field.min);
+	      if (field.max != null && !Number.isNaN(field.max)) inputEl.max = String(field.max);
+	      if (field.step != null && !Number.isNaN(field.step)) inputEl.step = String(field.step);
+	    }}
+	    if (field.default != null) inputEl.value = String(field.default);
+	  }}
+	
+	  if (field.type === 'checkbox') {{
+	    const checkboxRow = __owui_el('div', {{ className: 'flex items-center space-x-2' }}, []);
+	    const checkboxInner = __owui_el('div', {{ className: 'relative flex justify-center items-center gap-2' }}, [
+	      inputEl,
+	      __owui_el('label', {{ for: inputId, className: 'text-sm' }}, [field.placeholder || field.label || field.name]),
+	    ]);
+	    checkboxRow.appendChild(checkboxInner);
+	    wrapper.appendChild(checkboxRow);
+	  }} else {{
+	    const row = __owui_el('div', {{ className: 'flex mt-0.5 mb-0.5 space-x-2' }}, [
+	      __owui_el('div', {{ className: 'flex-1' }}, [inputEl]),
+	    ]);
+	    wrapper.appendChild(row);
+	  }}
+	
+	  if (field.description) {{
+	    wrapper.appendChild(__owui_el('div', {{ className: __owui_helpClass }}, [field.description]));
+	  }}
+	
+	  __owui_inputsByName.set(field.name, {{ field, inputEl }});
+	  return wrapper;
+	}}
 
-const __owui_header = __owui_el('div', {{
-  style: {{
-    marginBottom: '12px',
-  }}
-}}, [
-  __owui_el('div', {{ style: {{ fontSize: '18px', fontWeight: '600', marginBottom: __owui_description ? '6px' : '0' }} }}, [__owui_title]),
-  __owui_description ? __owui_el('div', {{ style: {{ fontSize: '13px', lineHeight: '1.4', opacity: '0.85' }} }}, [__owui_description]) : null,
-]);
-
-const __owui_error = __owui_el('div', {{
-  style: {{
-    display: 'none',
-    margin: '10px 0 0 0',
-    padding: '10px 12px',
-    borderRadius: '12px',
-    background: __owui_themeIsDark ? 'rgba(127,29,29,0.5)' : 'rgba(254,226,226,1)',
-    color: __owui_themeIsDark ? '#fecaca' : '#7f1d1d',
-    fontSize: '13px',
-  }}
-}}, []);
-
-const __owui_form = __owui_el('form', {{
-  style: {{
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '12px',
-    marginTop: '14px',
-  }},
-  onsubmit: (e) => {{
-    e.preventDefault();
-  }},
-}}, []);
-
-const __owui_inputsByName = new Map();
-
-function __owui_inputBaseStyle() {{
-  return {{
-    width: '100%',
-    boxSizing: 'border-box',
-    padding: '10px 12px',
-    borderRadius: '12px',
-    border: __owui_themeIsDark ? '1px solid rgba(55,65,81,0.9)' : '1px solid rgba(229,231,235,1)',
-    background: __owui_themeIsDark ? 'rgba(31,41,55,0.7)' : '#ffffff',
-    color: __owui_themeIsDark ? '#f3f4f6' : '#111827',
-    outline: 'none',
-    fontSize: '14px',
-  }};
-}}
-
-function __owui_labelStyle() {{
-  return {{
-    fontSize: '12px',
-    fontWeight: '600',
-    marginBottom: '6px',
-  }};
-}}
-
-function __owui_helpStyle() {{
-  return {{
-    fontSize: '12px',
-    opacity: '0.8',
-    marginTop: '6px',
-    lineHeight: '1.35',
-  }};
-}}
-
-function __owui_renderField(field) {{
-  const wrapper = __owui_el('div', null, []);
-  const labelRow = __owui_el('div', {{ style: __owui_labelStyle() }}, [
-    field.label + (field.required ? ' *' : ''),
-  ]);
-
-  let inputEl = null;
-  if (field.type === 'textarea') {{
-    inputEl = __owui_el('textarea', {{
-      placeholder: field.placeholder || '',
-      style: Object.assign(__owui_inputBaseStyle(), {{ minHeight: '96px', resize: 'vertical' }}),
-      rows: '4',
-    }}, []);
-    if (field.default != null) inputEl.value = String(field.default);
-  }} else if (field.type === 'select' || field.type === 'multiselect') {{
-    inputEl = __owui_el('select', {{
-      style: __owui_inputBaseStyle(),
-      multiple: field.type === 'multiselect' ? 'multiple' : null,
-      size: field.type === 'multiselect' ? String(Math.min(6, Math.max(3, field.options.length || 3))) : null,
-    }}, []);
-    if (field.type === 'select' && field.placeholder) {{
-      const opt = __owui_el('option', {{ value: '' }}, [field.placeholder]);
-      opt.disabled = field.required ? true : false;
-      opt.hidden = field.required ? true : false;
-      inputEl.appendChild(opt);
-    }}
-    for (const opt of field.options) {{
-      inputEl.appendChild(__owui_el('option', {{ value: opt }}, [opt]));
-    }}
-
-    const def = field.default;
-    if (field.type === 'multiselect' && Array.isArray(def)) {{
-      for (const optionEl of Array.from(inputEl.options)) {{
-        optionEl.selected = def.map(String).includes(optionEl.value);
-      }}
-    }} else if (field.type === 'select' && def != null) {{
-      inputEl.value = String(def);
-    }}
-  }} else if (field.type === 'checkbox') {{
-    inputEl = __owui_el('input', {{
-      type: 'checkbox',
-      style: {{
-        width: '16px',
-        height: '16px',
-      }},
-    }}, []);
-    inputEl.checked = Boolean(field.default);
-  }} else {{
-    const allowed = new Set(['text','email','url','date','time','number']);
-    const t = allowed.has(field.type) ? field.type : 'text';
-    inputEl = __owui_el('input', {{
-      type: t,
-      placeholder: field.placeholder || '',
-      style: __owui_inputBaseStyle(),
-    }}, []);
-    if (t === 'number') {{
-      if (field.min != null && !Number.isNaN(field.min)) inputEl.min = String(field.min);
-      if (field.max != null && !Number.isNaN(field.max)) inputEl.max = String(field.max);
-      if (field.step != null && !Number.isNaN(field.step)) inputEl.step = String(field.step);
-    }}
-    if (field.default != null) inputEl.value = String(field.default);
-  }}
-
-  if (field.type === 'checkbox') {{
-    const row = __owui_el('div', {{ style: {{ display: 'flex', alignItems: 'center', gap: '10px' }} }}, [
-      inputEl,
-      __owui_el('div', {{ style: {{ fontSize: '14px', fontWeight: '500', opacity: '0.95' }} }}, [field.placeholder || '']),
-    ]);
-    wrapper.appendChild(labelRow);
-    wrapper.appendChild(row);
-  }} else {{
-    wrapper.appendChild(labelRow);
-    wrapper.appendChild(inputEl);
-  }}
-
-  if (field.description) {{
-    wrapper.appendChild(__owui_el('div', {{ style: __owui_helpStyle() }}, [field.description]));
-  }}
-
-  __owui_inputsByName.set(field.name, {{ field, inputEl }});
-  return wrapper;
-}}
-
-for (const f of __owui_fields) {{
-  __owui_form.appendChild(__owui_renderField(f));
-}}
-
-const __owui_buttons = __owui_el('div', {{
-  style: {{
-    display: 'flex',
-    gap: '10px',
-    marginTop: '16px',
-  }},
-}}, []);
-
-function __owui_buttonStyle(kind) {{
-  const base = {{
-    flex: '1',
-    padding: '10px 12px',
-    borderRadius: '999px',
-    border: 'none',
-    cursor: 'pointer',
-    fontSize: '14px',
-    fontWeight: '600',
-  }};
-  if (kind === 'primary') {{
-    return Object.assign(base, {{
-      background: __owui_themeIsDark ? '#f3f4f6' : '#111827',
-      color: __owui_themeIsDark ? '#111827' : '#f9fafb',
-    }});
-  }}
-  return Object.assign(base, {{
-    background: __owui_themeIsDark ? 'rgba(31,41,55,0.9)' : 'rgba(243,244,246,1)',
-    color: __owui_themeIsDark ? '#f9fafb' : '#111827',
-  }});
-}}
-
-const __owui_cancelBtn = __owui_el('button', {{
-  type: 'button',
-  style: __owui_buttonStyle('secondary'),
-}}, [__owui_cancelLabel]);
-
-const __owui_submitBtn = __owui_el('button', {{
-  type: 'submit',
-  style: __owui_buttonStyle('primary'),
-}}, [__owui_submitLabel]);
-
-__owui_buttons.appendChild(__owui_cancelBtn);
-__owui_buttons.appendChild(__owui_submitBtn);
-
-__owui_modal.appendChild(__owui_header);
-__owui_modal.appendChild(__owui_error);
-__owui_modal.appendChild(__owui_form);
-__owui_modal.appendChild(__owui_buttons);
-__owui_overlay.appendChild(__owui_modal);
-document.body.appendChild(__owui_overlay);
+	for (let i = 0; i < __owui_fields.length; i++) {{
+	  __owui_fieldsEl.appendChild(__owui_renderField(__owui_fields[i], i));
+	}}
 
 function __owui_showError(message) {{
   __owui_error.textContent = String(message || 'Please check your inputs.');
-  __owui_error.style.display = 'block';
+  __owui_error.classList.remove('hidden');
   __owui_modal.scrollTo({{ top: 0, behavior: 'smooth' }});
 }}
 
@@ -462,7 +492,7 @@ function __owui_validate(values) {{
   for (const f of __owui_fields) {{
     if (!f.required) continue;
     if (__owui_isEmptyValue(f.type, values[f.name])) {{
-      return `Required: ${{f.label}}`;
+      return 'Required: ' + f.label;
     }}
   }}
   return null;
@@ -537,18 +567,46 @@ return await new Promise((resolve) => {{
 class Tools:
     """Tool that prompts the user with a structured form and returns the answers."""
 
-    async def prompt_form(
+    async def AskUserQuestion(
         self,
         schema: dict[str, Any],
         __event_call__=None,
         __event_emitter__=None,
     ) -> dict[str, Any]:
         """
-        Show a structured form in the user's browser and return the filled values.
+        Ask the user questions to gather input, clarify requirements, or get decisions during execution.
 
-        This uses Open WebUI's built-in `execute` event type (via `__event_call__`)
-        to render a modal form (checkboxes, selects, text inputs) and await a user
-        response.
+        This lets you ask questions with the right input type - offer choices via dropdown,
+        collect text responses, get yes/no answers via checkbox, request numbers, dates, etc.
+
+        WHEN TO USE:
+        1. Clarify ambiguous instructions with multiple questions
+        2. Get decisions requiring structured input or multiple choices
+        3. Offer options and let user choose direction
+        4. Gather user preferences, settings, or details
+        5. Collect information with specific formats (numbers, dates, emails)
+
+        DON'T USE FOR:
+        - Single yes/no questions (just ask directly in conversation)
+        - Simple single questions (just ask normally)
+        - Quick confirmations (ask directly)
+
+        CHOOSING INPUT TYPES:
+        - select: Choose ONE from options (like radio buttons) - use for decisions between 2-10 choices
+        - multiselect: Choose MULTIPLE from options - use when several can apply
+        - checkbox: Single yes/no toggle (within a larger form, not alone)
+        - text: Short free-form answer
+        - textarea: Longer explanation or description
+        - number: Numeric input (can set min/max/step constraints)
+        - email/url/date/time: Validated specific formats
+
+        TIPS:
+        - Mark questions required only if you truly can't proceed without them
+        - Provide clear labels and descriptions
+        - Set sensible defaults when you can anticipate the answer
+        - Use select/multiselect for constrained choices, text for open-ended
+        - Customize submit button text to match context
+        - Keep focused (5-8 questions works well, but adjust as needed)
 
         :param schema: Form schema object with keys: title, description, submit_label, cancel_label, fields.
         :return: A dict like {"cancelled": false, "values": {...}} or {"cancelled": true} or {"error": "..."}.
@@ -609,3 +667,16 @@ class Tools:
         if isinstance(result, dict):
             return result
         return {"value": result}
+
+    # Backwards-compatible alias for older prompts/configs.
+    async def prompt_form(
+        self,
+        schema: dict[str, Any],
+        __event_call__=None,
+        __event_emitter__=None,
+    ) -> dict[str, Any]:
+        return await self.AskUserQuestion(
+            schema=schema,
+            __event_call__=__event_call__,
+            __event_emitter__=__event_emitter__,
+        )
