@@ -70,6 +70,8 @@ def test_prompt_form_calls_execute_and_returns_result():
     assert "JSON.parse(atob(" in seen_events[0]["data"]["code"]
     assert "Explain model what to do instead" in seen_events[0]["data"]["code"]
     assert "Additional info, if the user provided:" in seen_events[0]["data"]["code"]
+    assert "Additional info for the model" in seen_events[0]["data"]["code"]
+    assert "result.additional_info" in seen_events[0]["data"]["code"]
 
     assert [e["type"] for e in seen_emits] == ["notification", "status", "status"]
     assert "would like you to answer some questions" in seen_emits[0]["data"]["content"]
@@ -188,3 +190,50 @@ def test_prompt_form_prefers_selected_model_name_from_metadata_for_notifications
         seen_emits[0]["data"]["content"]
         == "Selected Model would like you to answer some questions."
     )
+
+
+def test_prompt_form_capitalizes_options_by_default():
+    seen_events: list[dict] = []
+
+    async def fake_call(event: dict):
+        seen_events.append(event)
+        code = (event.get("data") or {}).get("code") or ""
+        if "JSON.parse(atob(" in code:
+            return {"status": "opened"}
+        return {"cancelled": True}
+
+    tool = mod.Tools()
+    out = asyncio.run(
+        tool.AskUserQuestion(
+            schema={
+                "title": "Test",
+                "fields": [
+                    {
+                        "name": "food",
+                        "type": "select",
+                        "options": ["potatoes", "apples", "gpt-5.2", "Already Capitalized"],
+                    }
+                ],
+            },
+            __event_call__=fake_call,
+        )
+    )
+
+    assert out.get("cancelled") is True
+    assert seen_events
+    code = (seen_events[0].get("data") or {}).get("code", "")
+
+    start = code.find('JSON.parse(atob("')
+    assert start != -1
+    start += len('JSON.parse(atob("')
+    end = code.find('"))', start)
+    assert end != -1
+    b64 = code[start:end]
+    decoded = json.loads(mod.base64.b64decode(b64.encode("ascii")).decode("utf-8"))
+
+    assert decoded["fields"][0]["options"] == [
+        "Potatoes",
+        "Apples",
+        "gpt-5.2",
+        "Already Capitalized",
+    ]

@@ -1,6 +1,12 @@
 ## [0.1.10] - 2026-01-04
 - Make the `schema` argument strict-schema compatible for OpenAI Responses native tool calling (prevents `invalid_function_parameters` 400s).
 
+## [0.1.11] - 2026-01-04
+- Capitalize select/multiselect option labels by default for readability (leaves identifiers like `gpt-5.2` unchanged).
+
+## [0.1.12] - 2026-01-04
+- Add an optional “additional info” popover on Confirm; included in the tool result only when filled.
+
 ## [0.1.6] - 2026-01-04
 - Adjust cancel `refusal` message wording to be more explicit and consistent.
 

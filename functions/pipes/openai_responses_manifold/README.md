@@ -91,7 +91,7 @@ See table below for full list of aliases.
 
 ### Debug logging
 
-Set `LOG_LEVEL=debug` (pipe-level or per-user valve) to embed inline debug logs in assistant messages.
+Set `LOG_LEVEL=DEBUG` (pipe-level valve) to embed inline debug logs in assistant messages.
 This surfaces details like:
 
 * API request/response structure

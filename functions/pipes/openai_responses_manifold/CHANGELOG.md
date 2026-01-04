@@ -10,6 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 - Improved strict tool schema handling to avoid mutating author-provided schemas while still enforcing `additionalProperties=false`.
 - Added model-family alias normalization for feature gating (`gpt-5-chat-latest` → `gpt-5`, `chatgpt-4o-latest` → `gpt-4o`).
 - Added a `REASONING_EFFORT` valve to set a default reasoning effort for reasoning models (without overwriting explicit request/alias effort).
+- Removed the per-user `LOG_LEVEL` valve; debug log citations are now controlled only by the pipe-level `LOG_LEVEL`.
+- Removed the `INHERIT` option from the per-user `REASONING_EFFORT` valve (defaults to `medium`).
 - Surface full OpenAI error payloads on `/responses` HTTP failures for easier debugging.
 
 ## [0.8.28] - 2025-08-21

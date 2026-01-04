@@ -1,7 +1,7 @@
 """
 title: AskUserQuestion
 id: AskUserQuestion
-version: 0.1.10
+version: 0.1.12
 description: Prompt the user with a structured form (checkboxes, selects, text) and return the answers to the model.
 license: MIT
 """
@@ -439,13 +439,81 @@ __owui_cancelBtn.addEventListener('blur', __owui_hideCancelTipSoon);
 __owui_cancelTipInput.addEventListener('focus', __owui_showCancelTip);
 __owui_cancelTipInput.addEventListener('blur', __owui_hideCancelTipSoon);
 
+const __owui_submitWrap = __owui_el('div', {{ className: 'relative' }}, []);
+
 const __owui_submitBtn = __owui_el('button', {{
   className: 'px-3.5 py-1.5 text-sm font-medium bg-black hover:bg-gray-900 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 transition rounded-full',
   type: 'submit',
 }}, [__owui_submitLabel]);
 
+const __owui_submitTip = __owui_el(
+  'div',
+  {{
+    className:
+      'hidden bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-lg shadow-lg p-3',
+    style: {{
+      position: 'absolute',
+      right: '0',
+      bottom: 'calc(100% + 8px)',
+      width: '18rem',
+      zIndex: '10000',
+    }},
+  }},
+  []
+);
+
+const __owui_submitTipTitle = __owui_el(
+  'div',
+  {{ className: 'text-xs font-medium mb-2 text-gray-700 dark:text-gray-200' }},
+  ['Additional info for the model']
+);
+const __owui_submitTipInput = __owui_el(
+  'textarea',
+  {{
+    className: __owui_inputClass + ' min-h-[72px] resize-y',
+    placeholder: 'Optional: extra context to send with your answers',
+    rows: '3',
+    autocomplete: 'off',
+  }},
+  []
+);
+const __owui_submitTipHelp = __owui_el(
+  'div',
+  {{ className: 'mt-1 text-xs text-gray-500 dark:text-gray-400' }},
+  ['Only sent if you confirm.']
+);
+
+__owui_submitTip.appendChild(__owui_submitTipTitle);
+__owui_submitTip.appendChild(__owui_submitTipInput);
+__owui_submitTip.appendChild(__owui_submitTipHelp);
+
+__owui_submitWrap.appendChild(__owui_submitBtn);
+__owui_submitWrap.appendChild(__owui_submitTip);
+
+let __owui_submitTipTimer = null;
+function __owui_showSubmitTip() {{
+  try {{
+    if (__owui_submitTipTimer) clearTimeout(__owui_submitTipTimer);
+  }} catch {{}}
+  __owui_submitTip.classList.remove('hidden');
+}}
+function __owui_hideSubmitTipSoon() {{
+  try {{
+    if (__owui_submitTipTimer) clearTimeout(__owui_submitTipTimer);
+  }} catch {{}}
+  __owui_submitTipTimer = setTimeout(() => {{
+    __owui_submitTip.classList.add('hidden');
+  }}, 250);
+}}
+__owui_submitWrap.addEventListener('mouseenter', __owui_showSubmitTip);
+__owui_submitWrap.addEventListener('mouseleave', __owui_hideSubmitTipSoon);
+__owui_submitBtn.addEventListener('focus', __owui_showSubmitTip);
+__owui_submitBtn.addEventListener('blur', __owui_hideSubmitTipSoon);
+__owui_submitTipInput.addEventListener('focus', __owui_showSubmitTip);
+__owui_submitTipInput.addEventListener('blur', __owui_hideSubmitTipSoon);
+
 __owui_buttons.appendChild(__owui_cancelWrap);
-__owui_buttons.appendChild(__owui_submitBtn);
+__owui_buttons.appendChild(__owui_submitWrap);
 __owui_form.appendChild(__owui_buttons);
 
 __owui_bodyInner.appendChild(__owui_form);
@@ -684,7 +752,14 @@ __owui_form.addEventListener('submit', (e) => {{
     __owui_showError(err);
     return;
   }}
-  __owui_finish({{ cancelled: false, values }});
+  const note = (__owui_submitTipInput && __owui_submitTipInput.value)
+    ? String(__owui_submitTipInput.value).trim()
+    : '';
+  const result = {{ cancelled: false, values }};
+  if (note) {{
+    result.additional_info = note;
+  }}
+  __owui_finish(result);
 }});
 
 __owui_submitBtn.addEventListener('click', (e) => {{
@@ -732,6 +807,7 @@ class Tools:
         schema: FormSchema,
         timeout_seconds: float = 1800.0,
         poll_interval_ms: int = 500,
+        capitalize_options: bool = True,
         __event_call__=None,
         __event_emitter__=None,
         __model__=None,
@@ -775,7 +851,8 @@ class Tools:
         :param schema: Form schema object with keys: title, description, submit_label, cancel_label, fields.
         :param timeout_seconds: Max seconds to wait for the user (0 to wait indefinitely).
         :param poll_interval_ms: Poll interval in milliseconds while waiting.
-        :return: A dict like {"cancelled": false, "values": {...}} or {"cancelled": true} or {"timeout": true, "error": "..."}.
+        :param capitalize_options: Capitalize human-readable select/multiselect options for readability.
+        :return: A dict like {"cancelled": false, "values": {...}} (optionally with "additional_info") or {"cancelled": true} (optionally with "refusal") or {"timeout": true, "error": "..."}.
         """
         if __event_call__ is None:
             return {
@@ -792,6 +869,28 @@ class Tools:
             parsed_schema = FormSchema.model_validate(schema)
         except Exception as exc:
             return {"error": f"Invalid schema: {exc}"}
+
+        def _capitalize_option(option: str) -> str:
+            option = (option or "").strip()
+            if not option:
+                return option
+            if any(ch.isupper() for ch in option):
+                return option
+            # Avoid mangling identifiers (model IDs, slugs, etc.).
+            if any(ch.isdigit() for ch in option) or any(ch in "-_./:" for ch in option):
+                return option
+
+            chars = list(option)
+            for idx, ch in enumerate(chars):
+                if ch.isalpha():
+                    chars[idx] = ch.upper()
+                    break
+            return "".join(chars)
+
+        if capitalize_options:
+            for field in parsed_schema.fields:
+                if field.options:
+                    field.options = [_capitalize_option(opt) for opt in field.options]
 
         def _extract_model_name(obj: Any) -> str | None:
             if obj is None:

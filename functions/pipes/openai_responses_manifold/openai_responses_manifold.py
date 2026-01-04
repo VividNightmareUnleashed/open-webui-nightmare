@@ -747,17 +747,27 @@ class Pipe:
     class UserValves(BaseModel):
         """Per-user valve overrides."""
 
-        REASONING_EFFORT: Literal["minimal", "low", "medium", "high", "xhigh", "INHERIT"] = Field(
-            default="INHERIT",
-            description="Override reasoning effort for reasoning models. 'INHERIT' uses the pipe default.",
+        class Config:
+            extra = "ignore"
+
+        REASONING_EFFORT: Literal["minimal", "low", "medium", "high", "xhigh"] = Field(
+            default="medium",
+            description="Override reasoning effort for reasoning models (minimal | low | medium | high | xhigh).",
         )
 
-        LOG_LEVEL: Literal[
-            "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "INHERIT"
-        ] = Field(
-            default="INHERIT",
-            description="Select logging level. 'INHERIT' uses the pipe default.",
-        )
+        @model_validator(mode="before")
+        @classmethod
+        def _normalize_reasoning_effort(cls, data: Any) -> Any:
+            """Back-compat: map legacy 'INHERIT' to the default."""
+            if not isinstance(data, dict):
+                return data
+
+            effort = data.get("REASONING_EFFORT")
+            if isinstance(effort, str):
+                normalized = effort.strip().lower()
+                data = dict(data)
+                data["REASONING_EFFORT"] = "medium" if normalized == "inherit" else normalized
+            return data
 
     # 4.2 Constructor and Entry Points
     def __init__(self):
@@ -1482,12 +1492,11 @@ class Pipe:
             if not status_indicator._done and status_indicator._items:
                 assistant_message = await status_indicator.finish(assistant_message)
 
-            if valves.LOG_LEVEL != "INHERIT":
-                if event_emitter:
-                    session_id = SessionLogger.session_id.get()
-                    logs = SessionLogger.logs.get(session_id, [])
-                    if logs:
-                        await self._emit_citation(event_emitter, "\n".join(logs), "Logs")
+            if event_emitter and valves.LOG_LEVEL == "DEBUG":
+                session_id = SessionLogger.session_id.get()
+                logs = SessionLogger.logs.get(session_id, [])
+                if logs:
+                    await self._emit_citation(event_emitter, "\n".join(logs), "Logs")
 
             # Emit completion (middleware.py also does this so this just covers if there is a downstream error)
             await self._emit_completion(event_emitter, content="", usage=total_usage, done=True)  # There must be an empty content to avoid breaking the UI
@@ -2528,13 +2537,13 @@ class Pipe:
     def _merge_valves(self, global_valves, user_valves) -> "Pipe.Valves":
         """Merge user-level valves into the global defaults.
 
-        Any field set to ``"INHERIT"`` (case-insensitive) is ignored so the
-        corresponding global value is preserved.
+        Back-compat: any field set to ``"INHERIT"`` (case-insensitive) is
+        ignored so the corresponding global value is preserved.
         """
         if not user_valves:
             return global_valves
 
-        # Merge: update only fields not set to "INHERIT"
+        # Merge: ignore legacy "INHERIT" sentinel values.
         update = {
             k: v
             for k, v in user_valves.model_dump().items()

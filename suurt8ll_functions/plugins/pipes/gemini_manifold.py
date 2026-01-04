@@ -39,6 +39,7 @@ from urllib.parse import urlparse, parse_qs
 import xxhash
 import asyncio
 import aiofiles
+import inspect
 from aiocache import cached
 from aiocache.base import BaseCache
 from aiocache.serializers import NullSerializer
@@ -2207,6 +2208,14 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is True.""",
         )
+        MAX_TOOL_CALL_LOOPS: int = Field(
+            default=8,
+            ge=1,
+            le=25,
+            description="""Maximum number of native tool-calling iterations (model → tool → model).
+            Prevents infinite loops if the model keeps calling tools.
+            Default value is 8.""",
+        )
         # FIXME: remove, toggle filter handles this now
         ENABLE_URL_CONTEXT_TOOL: bool = Field(
             default=False,
@@ -2380,6 +2389,11 @@ class Pipe:
             This is only applicable for Gemini 2.5 models.
             Default value is None.""",
         )
+        MAX_TOOL_CALL_LOOPS: int | None | Literal[""] = Field(
+            default=None,
+            description="""Maximum number of native tool-calling iterations (model → tool → model).
+            Overrides the admin setting. Default value is None.""",
+        )
         ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
             default=None,
             description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
@@ -2507,6 +2521,7 @@ class Pipe:
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]] | None,
         __metadata__: "Metadata",
+        __tools__: dict[str, dict[str, Any]] | list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict | str, None] | str:
 
         self._add_log_handler(self.valves.LOG_LEVEL)
@@ -2552,6 +2567,8 @@ class Pipe:
             "files",
             "options",
             "stream_options",
+            "tools",
+            "tool_choice",
         }
         model_page_params = {
             key: value for key, value in body.items() if key not in known_body_keys
@@ -2689,6 +2706,29 @@ class Pipe:
         )
         gen_content_conf.system_instruction = builder.system_prompt
 
+        # ------------------------------------------------------------------
+        # Native tool calling (Open WebUI `__tools__`)
+        # ------------------------------------------------------------------
+        if inspect.isawaitable(__tools__):
+            __tools__ = await __tools__
+
+        openwebui_tools = self._normalize_openwebui_tools(__tools__)
+        openwebui_callable_tools = {
+            name: tool
+            for name, tool in openwebui_tools.items()
+            if callable(tool.get("callable"))
+        }
+        function_calling_mode = (__metadata__.get("params") or {}).get("function_calling")
+        native_tool_calling_enabled = (
+            function_calling_mode == "native" and bool(openwebui_callable_tools)
+        )
+
+        if native_tool_calling_enabled:
+            self._add_openwebui_tools_to_config(gen_content_conf, openwebui_callable_tools)
+            log.debug(
+                f"Enabled native tool calling with {len(openwebui_callable_tools)} Open WebUI tool(s)."
+            )
+
         # Check for image generation capabilities using the clean ID.
         is_image_model = self._is_image_model(model_id, model_config)
         system_prompt_unsupported = is_image_model or "gemma" in model_id
@@ -2721,6 +2761,11 @@ class Pipe:
                 f"Forcing non-streaming mode due to {valves.IMAGE_RESOLUTION} resolution setting."
             )
             is_streaming = False
+        if native_tool_calling_enabled and is_streaming:
+            # Tool calling can introduce multi-turn pauses (e.g., AskUserQuestion).
+            # For reliability, force non-streaming mode during tool-call loops.
+            log.info("Forcing non-streaming mode because native tool calling is enabled.")
+            is_streaming = False
         request_type_str = "streaming" if is_streaming else "non-streaming"
 
         # Emit a status update. EventEmitter handles formatting and timestamps.
@@ -2729,6 +2774,22 @@ class Pipe:
                 f"Sending {request_type_str} request to {api_name}..."
             )
         )
+
+        if native_tool_calling_enabled:
+            log.info("Native tool calling is enabled. Entering tool-call loop.")
+            log.debug("pipe method has finished.")
+            return self._run_native_tool_calling_loop(
+                client=client,
+                model_id=model_id,
+                contents=contents,
+                gen_content_conf=gen_content_conf,
+                openwebui_tools=openwebui_callable_tools,
+                app=__request__.app,
+                event_emitter=event_emitter,
+                __metadata__=__metadata__,
+                max_loops=int(getattr(valves, "MAX_TOOL_CALL_LOOPS", 8) or 8),
+                api_name=api_name,
+            )
 
         if is_streaming:
             # Streaming response
@@ -3413,6 +3474,377 @@ class Pipe:
             )
 
         return gen_content_conf
+
+    @staticmethod
+    def _normalize_openwebui_tools(
+        tools: Any | None,
+    ) -> dict[str, dict[str, Any]]:
+        """Normalize Open WebUI tool inputs into a name->tool mapping.
+
+        Open WebUI may pass tools as a dict (name -> tool dict) or as a list of
+        tool dicts. We prefer the `spec.name` when available, falling back to
+        wrapper keys.
+        """
+        if not tools:
+            return {}
+
+        normalized: dict[str, dict[str, Any]] = {}
+
+        if isinstance(tools, dict):
+            iterable = tools.items()
+        elif isinstance(tools, list):
+            iterable = ((None, item) for item in tools)
+        else:
+            return {}
+
+        for key, item in iterable:
+            if not isinstance(item, dict):
+                continue
+
+            spec = item.get("spec") if isinstance(item.get("spec"), dict) else None
+            fn_wrapper = item.get("function") if isinstance(item.get("function"), dict) else None
+
+            name = (
+                (spec.get("name") if spec else None)
+                or (fn_wrapper.get("name") if fn_wrapper else None)
+                or item.get("name")
+                or key
+            )
+            if not isinstance(name, str) or not name.strip():
+                continue
+
+            normalized[name.strip()] = item
+
+        return normalized
+
+    @staticmethod
+    def _add_openwebui_tools_to_config(
+        gen_content_conf: types.GenerateContentConfig,
+        tools: dict[str, dict[str, Any]],
+    ) -> None:
+        """Register Open WebUI tools for Gemini native function calling.
+
+        The google-genai SDK can infer tool schemas from Python function
+        signatures. Open WebUI wraps tool callables to remove injected params
+        from signatures, which improves compatibility with google-genai.
+        """
+        if not tools:
+            return
+
+        if gen_content_conf.tools is None:
+            gen_content_conf.tools = []
+
+        added = 0
+        for name, tool in tools.items():
+            fn = tool.get("callable")
+            if not callable(fn):
+                log.debug(f"Open WebUI tool '{name}' has no callable; skipping.")
+                continue
+            # Ensure the SDK sees the intended tool name (important for wrapped functions).
+            try:
+                setattr(fn, "__name__", name)
+                setattr(fn, "__qualname__", name)
+            except Exception:
+                pass
+            gen_content_conf.tools.append(fn)
+            added += 1
+
+        if added == 0:
+            log.warning(
+                "Native tool calling was requested, but no callable Open WebUI tools were provided."
+            )
+
+    @staticmethod
+    def _coerce_to_jsonable(value: Any) -> Any:
+        """Best-effort conversion of arbitrary values into JSON-serializable types."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+
+        if isinstance(value, list):
+            return [Pipe._coerce_to_jsonable(v) for v in value]
+
+        if isinstance(value, dict):
+            return {str(k): Pipe._coerce_to_jsonable(v) for k, v in value.items()}
+
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+
+        if isinstance(value, (bytearray, memoryview)):
+            return bytes(value).decode("utf-8", errors="replace")
+
+        if isinstance(value, str):
+            return value
+
+        # Protobuf Struct-like, pydantic models, etc.
+        if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
+            try:
+                dumped = value.model_dump()
+                return Pipe._coerce_to_jsonable(dumped)
+            except Exception:
+                pass
+
+        if hasattr(value, "dict") and callable(getattr(value, "dict")):
+            try:
+                dumped = value.dict()
+                return Pipe._coerce_to_jsonable(dumped)
+            except Exception:
+                pass
+
+        if hasattr(value, "items") and callable(getattr(value, "items")):
+            try:
+                return {str(k): Pipe._coerce_to_jsonable(v) for k, v in value.items()}
+            except Exception:
+                pass
+
+        try:
+            return json.loads(json.dumps(value, default=str))
+        except Exception:
+            return str(value)
+
+    @staticmethod
+    def _coerce_args_dict(raw_args: Any) -> dict[str, Any]:
+        """Coerce Gemini function-call args into a plain dict."""
+        if raw_args is None:
+            return {}
+
+        if isinstance(raw_args, dict):
+            return cast(dict[str, Any], Pipe._coerce_to_jsonable(raw_args))
+
+        if isinstance(raw_args, str):
+            try:
+                parsed = json.loads(raw_args)
+                if isinstance(parsed, dict):
+                    return cast(dict[str, Any], Pipe._coerce_to_jsonable(parsed))
+            except Exception:
+                return {"_raw": raw_args}
+
+        if hasattr(raw_args, "items") and callable(getattr(raw_args, "items")):
+            try:
+                as_dict = dict(raw_args.items())
+                return cast(dict[str, Any], Pipe._coerce_to_jsonable(as_dict))
+            except Exception:
+                pass
+
+        try:
+            parsed = json.loads(json.dumps(raw_args, default=str))
+            if isinstance(parsed, dict):
+                return cast(dict[str, Any], Pipe._coerce_to_jsonable(parsed))
+        except Exception:
+            pass
+
+        return {"_raw": str(raw_args)}
+
+    @staticmethod
+    def _extract_function_calls_from_parts(parts: list[Any] | None) -> list[dict[str, Any]]:
+        """Extract Gemini function calls from a list of response parts."""
+        calls: list[dict[str, Any]] = []
+        if not parts:
+            return calls
+
+        for part in parts:
+            fn_call = getattr(part, "function_call", None) or getattr(part, "functionCall", None)
+            if not fn_call:
+                continue
+
+            name = None
+            raw_args: Any = None
+
+            if isinstance(fn_call, dict):
+                name = fn_call.get("name")
+                raw_args = fn_call.get("args") or fn_call.get("arguments")
+            else:
+                name = getattr(fn_call, "name", None)
+                raw_args = (
+                    getattr(fn_call, "args", None)
+                    or getattr(fn_call, "arguments", None)
+                    or getattr(fn_call, "params", None)
+                )
+
+            if not isinstance(name, str) or not name.strip():
+                continue
+
+            calls.append(
+                {
+                    "name": name.strip(),
+                    "args": Pipe._coerce_args_dict(raw_args),
+                }
+            )
+
+        return calls
+
+    @staticmethod
+    def _build_function_response_content(
+        tool_results: list[tuple[str, Any]],
+    ) -> types.Content:
+        """Build a Gemini Content message containing one or more function responses."""
+        parts: list[types.Part] = []
+
+        for name, result in tool_results:
+            jsonable_result = Pipe._coerce_to_jsonable(result)
+            response_payload = jsonable_result if isinstance(jsonable_result, dict) else {"content": jsonable_result}
+
+            try:
+                function_response_obj = types.FunctionResponse(
+                    name=name,
+                    response=response_payload,
+                )
+                parts.append(types.Part(function_response=function_response_obj))
+            except Exception:
+                # Fallback: pass a raw dict if the SDK model types reject the object.
+                parts.append(
+                    types.Part(
+                        function_response={
+                            "name": name,
+                            "response": response_payload,
+                        }
+                    )
+                )
+
+        return types.Content(role="function", parts=parts)
+
+    async def _execute_openwebui_tool_calls(
+        self,
+        calls: list[dict[str, Any]],
+        tools: dict[str, dict[str, Any]],
+        event_emitter: EventEmitter,
+    ) -> list[tuple[str, Any]]:
+        """Execute Open WebUI tool calls sequentially and return (name, result) pairs."""
+        results: list[tuple[str, Any]] = []
+
+        for call in calls:
+            name = call.get("name")
+            args = call.get("args") or {}
+
+            if not isinstance(name, str) or not name.strip():
+                continue
+
+            tool_entry = tools.get(name)
+            if not tool_entry:
+                results.append((name, {"error": f"Tool '{name}' not found."}))
+                continue
+
+            fn = tool_entry.get("callable")
+            if not callable(fn):
+                results.append((name, {"error": f"Tool '{name}' is not callable."}))
+                continue
+
+            if not isinstance(args, dict):
+                args = {"_raw": Pipe._coerce_to_jsonable(args)}
+
+            asyncio.create_task(event_emitter.emit_status(f"Running tool `{name}`…"))
+
+            try:
+                if inspect.iscoroutinefunction(fn):
+                    result = await fn(**args)
+                else:
+                    result = await asyncio.to_thread(fn, **args)
+                    if inspect.isawaitable(result):
+                        result = await result
+            except Exception as exc:
+                log.exception(f"Tool '{name}' execution failed.")
+                result = {"error": f"Tool '{name}' execution failed: {exc}"}
+
+            results.append((name, result))
+
+        return results
+
+    async def _run_native_tool_calling_loop(
+        self,
+        *,
+        client: Any,
+        model_id: str,
+        contents: list[types.Content],
+        gen_content_conf: types.GenerateContentConfig,
+        openwebui_tools: dict[str, dict[str, Any]],
+        app: FastAPI,
+        event_emitter: EventEmitter,
+        __metadata__: "Metadata",
+        max_loops: int,
+        api_name: str,
+    ) -> AsyncGenerator[dict | str, None]:
+        """Run a multi-turn Gemini function-calling loop using Open WebUI tools."""
+        if max_loops < 1:
+            max_loops = 1
+
+        for loop_idx in range(max_loops):
+            asyncio.create_task(
+                event_emitter.emit_status(
+                    f"Sending tool-call request to {api_name} (step {loop_idx + 1}/{max_loops})…"
+                )
+            )
+
+            try:
+                res: types.GenerateContentResponse = await client.aio.models.generate_content(  # type: ignore
+                    model=model_id,
+                    contents=contents,
+                    config=gen_content_conf,
+                )
+            except Exception as exc:
+                err = f"{api_name} request failed during tool-call loop: {exc}"
+                log.exception(err)
+                await event_emitter.emit_error(err)
+                return
+
+            parts: list[Any] = list(getattr(res, "parts", None) or [])
+            calls = self._extract_function_calls_from_parts(parts)
+
+            if not calls:
+                # Final response: stream it through the unified processor (adapter).
+                async def single_item_stream(
+                    response: types.GenerateContentResponse,
+                ) -> AsyncGenerator[types.GenerateContentResponse, None]:
+                    yield response
+
+                async for item in self._unified_response_processor(
+                    single_item_stream(res),
+                    app,
+                    event_emitter,
+                    __metadata__,
+                ):
+                    yield item
+                return
+
+            # Append the model's function-call message to the conversation state.
+            candidate = self._get_first_candidate(getattr(res, "candidates", None))
+            if candidate and getattr(candidate, "content", None):
+                contents.append(candidate.content)
+            else:
+                try:
+                    contents.append(types.Content(role="model", parts=cast(list[types.Part], parts)))
+                except Exception:
+                    pass
+
+            # Execute tool calls and append function responses.
+            tool_results = await self._execute_openwebui_tool_calls(
+                calls,
+                openwebui_tools,
+                event_emitter,
+            )
+            if not tool_results:
+                err = "Model requested tool calls, but none could be executed."
+                log.error(err)
+                await event_emitter.emit_error(err)
+                return
+            if tool_results:
+                try:
+                    contents.append(self._build_function_response_content(tool_results))
+                except Exception:
+                    # Avoid killing the loop; send a best-effort plain-text error.
+                    err = "Failed to build function response content for Gemini."
+                    log.exception(err)
+                    await event_emitter.emit_error(err)
+                    return
+
+                asyncio.create_task(
+                    event_emitter.emit_status("Tool result sent back to the model…")
+                )
+
+        error_msg = (
+            f"Exceeded maximum native tool-call iterations ({max_loops}). "
+            "The model may be stuck calling tools repeatedly."
+        )
+        await event_emitter.emit_error(error_msg)
+        return
 
     # endregion 2.3 GenerateContentConfig assembly
 

@@ -43,12 +43,16 @@ Example tool call schema:
 Notes:
 - Fields should use `name`, but `key` and `id` are also accepted.
 - For `select` / `multiselect`, `options` should be an array of strings; `{ "label": "...", "value": "..." }` objects are accepted and coerced to strings.
+- Options are capitalized by default for readability (identifiers like `gpt-5.2` are left unchanged). Set `capitalize_options=false` to disable.
 
 Return value (to the model):
 
 ```json
 {"cancelled": false, "values": {"destination": "Tokyo", "days": 5, "pace": "Balanced", "include_museums": true, "notes": ""}}
 ```
+
+Confirm behavior:
+- If the user confirms and fills the “Additional info for the model” popover: `{"cancelled": false, "values": {...}, "additional_info": "<note>"}` (the `additional_info` field is omitted if empty)
 
 Cancel behavior:
 - If the user cancels: `{"cancelled": true}`

@@ -474,6 +474,16 @@ def test_reasoning_effort_defaults_to_medium(monkeypatch):
     assert sent.reasoning["effort"] == "medium"
 
 
+def test_reasoning_effort_user_valve_legacy_inherit_coerces_to_medium():
+    user_valves = mod.Pipe.UserValves.model_validate({"REASONING_EFFORT": "INHERIT"})
+    assert user_valves.REASONING_EFFORT == "medium"
+
+
+def test_user_valves_ignores_legacy_log_level_key():
+    user_valves = mod.Pipe.UserValves.model_validate({"LOG_LEVEL": "DEBUG"})
+    assert user_valves.REASONING_EFFORT == "medium"
+
+
 @pytest.mark.parametrize(
     "payload",
     ["", "{", json.dumps([1, {}]), json.dumps({"server_label": "x"})],
