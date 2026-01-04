@@ -39,7 +39,7 @@ Example tool call schema:
 ```
 
 Notes:
-- Fields should use `name`, but `key` is also accepted.
+- Fields should use `name`, but `key` and `id` are also accepted.
 - For `select` / `multiselect`, `options` should be an array of strings; `{ "label": "...", "value": "..." }` objects are accepted and coerced to strings.
 
 Return value (to the model):
@@ -47,6 +47,14 @@ Return value (to the model):
 ```json
 {"cancelled": false, "values": {"destination": "Tokyo", "days": 5, "pace": "Balanced", "include_museums": true, "notes": ""}}
 ```
+
+Cancel behavior:
+- If the user cancels: `{"cancelled": true}`
+- If the user cancels and fills “Explain model what to do instead”: `{"cancelled": true, "refusal": "User cancelled the form and declined to answer. Additional info, if the user provided: <note>"}` (the `refusal` field is omitted if empty)
+
+Timeout behavior:
+- If the user doesn’t respond within `timeout_seconds`: `{"timeout": true, "error": "Timed out ..."}` (no `cancelled`/`refusal`)
+- Set `timeout_seconds=0` to wait indefinitely
 
 ## Supported Field Types
 

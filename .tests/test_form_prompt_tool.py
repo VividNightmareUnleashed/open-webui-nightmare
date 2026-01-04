@@ -1,5 +1,6 @@
 import asyncio
 
+import json
 
 from tools.form_prompt import form_prompt as mod
 
@@ -14,8 +15,7 @@ def test_prompt_form_requires_event_call():
             }
         )
     )
-    assert isinstance(out, str)
-    assert "WebSocket event calls" in out
+    assert out["error"].startswith("Missing __event_call__")
 
 
 def test_prompt_form_validates_schema():
@@ -33,6 +33,9 @@ def test_prompt_form_calls_execute_and_returns_result():
 
     async def fake_call(event: dict):
         seen_events.append(event)
+        code = (event.get("data") or {}).get("code") or ""
+        if "JSON.parse(atob(" in code:
+            return {"status": "opened"}
         return {"cancelled": False, "values": {"destination": "Tokyo"}}
 
     async def fake_emit(event: dict) -> None:
@@ -61,9 +64,12 @@ def test_prompt_form_calls_execute_and_returns_result():
     assert out == {"cancelled": False, "values": {"destination": "Tokyo"}}
 
     assert seen_events
+    assert len(seen_events) >= 2
     assert seen_events[0]["type"] == "execute"
     assert "code" in seen_events[0]["data"]
     assert "JSON.parse(atob(" in seen_events[0]["data"]["code"]
+    assert "Explain model what to do instead" in seen_events[0]["data"]["code"]
+    assert "Additional info, if the user provided:" in seen_events[0]["data"]["code"]
 
     assert [e["type"] for e in seen_status] == ["status", "status"]
     assert seen_status[0]["data"]["done"] is False
@@ -71,8 +77,14 @@ def test_prompt_form_calls_execute_and_returns_result():
 
 
 def test_prompt_form_accepts_common_llm_schema_variants():
+    seen_events: list[dict] = []
+
     async def fake_call(event: dict):
-        return event
+        seen_events.append(event)
+        code = (event.get("data") or {}).get("code") or ""
+        if "JSON.parse(atob(" in code:
+            return {"status": "opened"}
+        return {"cancelled": True}
 
     tool = mod.Tools()
     out = asyncio.run(
@@ -81,7 +93,7 @@ def test_prompt_form_accepts_common_llm_schema_variants():
                 "title": "Test",
                 "fields": [
                     {
-                        "key": "level",
+                        "id": "level",
                         "type": "radio",
                         "options": [{"label": "Expert", "value": "Expert"}],
                     }
@@ -91,4 +103,53 @@ def test_prompt_form_accepts_common_llm_schema_variants():
         )
     )
 
-    assert out["type"] == "execute"
+    assert out.get("cancelled") is True
+    assert seen_events
+    assert "JSON.parse(atob(" in (seen_events[0].get("data") or {}).get("code", "")
+
+
+def test_prompt_form_accepts_json_string_schema():
+    async def fake_call(event: dict):
+        code = (event.get("data") or {}).get("code") or ""
+        if "JSON.parse(atob(" in code:
+            return {"status": "opened"}
+        return {"cancelled": True}
+
+    tool = mod.Tools()
+    schema = json.dumps(
+        {
+            "title": "Test",
+            "fields": [{"name": "x", "label": "X", "type": "text"}],
+        }
+    )
+
+    out = asyncio.run(tool.AskUserQuestion(schema=schema, __event_call__=fake_call))
+    assert out.get("cancelled") is True
+
+
+def test_prompt_form_timeout_does_not_return_refusal():
+    async def fake_call(event: dict):
+        code = (event.get("data") or {}).get("code") or ""
+        # First call opens the UI.
+        if "JSON.parse(atob(" in code:
+            return {"status": "opened"}
+        # Poll/cleanup calls: no result yet.
+        return None
+
+    tool = mod.Tools()
+    out = asyncio.run(
+        tool.AskUserQuestion(
+            schema={
+                "title": "Test",
+                "fields": [{"name": "x", "label": "X", "type": "text"}],
+            },
+            __event_call__=fake_call,
+            timeout_seconds=0.2,
+            poll_interval_ms=10,
+        )
+    )
+
+    assert out.get("timeout") is True
+    assert "Timed out" in (out.get("error") or "")
+    assert "refusal" not in out
+    assert "cancelled" not in out

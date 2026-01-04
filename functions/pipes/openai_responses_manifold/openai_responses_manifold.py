@@ -6,7 +6,7 @@ author_url: https://github.com/jrkropp
 git_url: https://github.com/jrkropp/open-webui-developer-toolkit/blob/main/functions/pipes/openai_responses_manifold/openai_responses_manifold.py
 description: Brings OpenAI Response API support to Open WebUI, enabling features not possible via Completions API.
 required_open_webui_version: 0.6.3
-version: 0.8.29
+version: 0.8.30
 license: MIT
 """
 
@@ -521,6 +521,14 @@ class Pipe:
         )
 
         # 3) Reasoning & summaries
+        REASONING_EFFORT: Literal["minimal", "low", "medium", "high", "xhigh"] = Field(
+            default="medium",
+            description=(
+                "Override reasoning effort (minimal | low | medium | high | xhigh). "
+                "Applied only to reasoning models and does not overwrite an explicit effort set by "
+                "the request body or pseudo-model alias."
+            ),
+        )
         REASONING_SUMMARY: Literal["auto", "concise", "detailed", "disabled"] = Field(
             default="disabled",
             description="REQUIRES VERIFIED OPENAI ORG. Visible reasoning summary (auto | concise | detailed | disabled). Works on gpt-5, o3, o4-mini; ignored otherwise. Docs: https://platform.openai.com/docs/api-reference/responses/create#responses-create-reasoning",
@@ -678,6 +686,12 @@ class Pipe:
 
     class UserValves(BaseModel):
         """Per-user valve overrides."""
+
+        REASONING_EFFORT: Literal["minimal", "low", "medium", "high", "xhigh", "INHERIT"] = Field(
+            default="INHERIT",
+            description="Override reasoning effort for reasoning models. 'INHERIT' uses the pipe default.",
+        )
+
         LOG_LEVEL: Literal[
             "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "INHERIT"
         ] = Field(
@@ -761,6 +775,12 @@ class Pipe:
 
         # Normalize to family-level model name (e.g., 'o3' from 'o3-2025-04-16') to be used for feature detection.
         model_family = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", responses_body.model)
+
+        # Apply REASONING_EFFORT to reasoning models unless already set by the request / alias.
+        if model_family in FEATURE_SUPPORT["reasoning"] and valves.REASONING_EFFORT:
+            reasoning_params = dict(responses_body.reasoning or {})
+            reasoning_params.setdefault("effort", valves.REASONING_EFFORT)
+            responses_body.reasoning = reasoning_params
 
         # Resolve __tools__ coroutine returned by newer Open WebUI versions.
         if inspect.isawaitable(__tools__):

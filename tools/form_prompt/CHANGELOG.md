@@ -1,3 +1,11 @@
+## [0.1.6] - 2026-01-04
+- Adjust cancel `refusal` message wording to be more explicit and consistent.
+
+## [0.1.5] - 2026-01-04
+- Avoid WebSocket call timeouts by opening the UI immediately and polling for results (`timeout_seconds`, `poll_interval_ms`).
+- Add a Cancel hover popover (“Explain model what to do instead”) that optionally returns a `refusal` string.
+- Accept `id` as an alias for field `name`.
+
 ## [0.1.4] - 2026-01-04
 - Rename tool to `AskUserQuestion` (keeps `prompt_form` as a backwards-compatible alias).
 

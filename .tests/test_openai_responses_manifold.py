@@ -341,6 +341,76 @@ def test_builtin_file_tools_injected(monkeypatch):
     assert sent.input[0]["content"][0]["file_id"] == "file-abc"
 
 
+def test_reasoning_effort_user_valve_applied(monkeypatch):
+    pipe = mod.Pipe()
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_streaming_loop(
+        body, valves, event_emitter, metadata, tools, *, openai_file_citations=None
+    ):
+        captured["body"] = body
+        return "ok"
+
+    monkeypatch.setattr(pipe, "_run_streaming_loop", fake_run_streaming_loop)
+
+    async def emitter(_event):
+        return None
+
+    body = {"model": "o3", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+
+    result = asyncio.run(
+        pipe.pipe(
+            body,
+            __user__={"id": "u1", "valves": {"REASONING_EFFORT": "xhigh"}},
+            __request__=None,  # unused by this code path
+            __event_emitter__=emitter,
+            __metadata__={"model": {"id": "openai_responses.o3"}, "chat_id": None},
+            __tools__=None,
+        )
+    )
+    assert result == "ok"
+
+    sent = captured["body"]
+    assert isinstance(sent, mod.ResponsesBody)
+    assert sent.reasoning["effort"] == "xhigh"
+
+
+def test_reasoning_effort_defaults_to_medium(monkeypatch):
+    pipe = mod.Pipe()
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_streaming_loop(
+        body, valves, event_emitter, metadata, tools, *, openai_file_citations=None
+    ):
+        captured["body"] = body
+        return "ok"
+
+    monkeypatch.setattr(pipe, "_run_streaming_loop", fake_run_streaming_loop)
+
+    async def emitter(_event):
+        return None
+
+    body = {"model": "o3", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+
+    result = asyncio.run(
+        pipe.pipe(
+            body,
+            __user__={"id": "u1"},
+            __request__=None,  # unused by this code path
+            __event_emitter__=emitter,
+            __metadata__={"model": {"id": "openai_responses.o3"}, "chat_id": None},
+            __tools__=None,
+        )
+    )
+    assert result == "ok"
+
+    sent = captured["body"]
+    assert isinstance(sent, mod.ResponsesBody)
+    assert sent.reasoning["effort"] == "medium"
+
+
 @pytest.mark.parametrize(
     "payload",
     ["", "{", json.dumps([1, {}]), json.dumps({"server_label": "x"})],

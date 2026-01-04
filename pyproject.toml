@@ -46,6 +46,7 @@ exclude = [
 [tool.pytest.ini_options]
 testpaths = [".tests"]
 pythonpath = [
+  ".",
   "external/open-webui/backend"
 ]
 addopts = """
