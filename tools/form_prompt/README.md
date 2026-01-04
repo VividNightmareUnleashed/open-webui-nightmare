@@ -5,6 +5,8 @@ Interactive, **structured user input** for Open WebUI tool calling.
 This tool uses Open WebUI’s built-in `__event_call__` + `execute` event to render a modal form in the browser (text inputs, selects, checkboxes, etc.) and returns the filled values to the model as JSON.
 The injected modal uses the same Tailwind classnames as Open WebUI’s native modal/input-variables UI, so it blends in visually.
 
+It also notifies the user that the model is waiting for input (toast + best-effort system notification when supported).
+
 ## Install
 
 1. Open WebUI → **Admin Panel** → **Tools**

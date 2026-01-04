@@ -1,7 +1,7 @@
 """
 title: AskUserQuestion
 id: AskUserQuestion
-version: 0.1.6
+version: 0.1.9
 description: Prompt the user with a structured form (checkboxes, selects, text) and return the answers to the model.
 license: MIT
 """
@@ -178,20 +178,48 @@ def _schema_to_b64(schema: dict[str, Any]) -> str:
     return base64.b64encode(payload).decode("ascii")
 
 
-def _build_open_execute_code(schema: FormSchema, request_id: str) -> str:
+def _build_open_execute_code(schema: FormSchema, request_id: str, model_name: str) -> str:
     schema_b64 = _schema_to_b64(schema.model_dump())
+    model_name_json = json.dumps(model_name or "", ensure_ascii=True)
 
     # This code runs inside Open WebUI's built-in `execute` event handler.
     # It must return quickly to avoid Socket.IO call timeouts.
     return f"""
 const __owui_schema = JSON.parse(atob("{schema_b64}"));
 const __owui_id = "{request_id}";
+const __owui_modelName = {model_name_json};
 
 window.__owuiAskUserQuestion = window.__owuiAskUserQuestion || {{}};
 const __owui_store = window.__owuiAskUserQuestion;
 if (__owui_store[__owui_id] && __owui_store[__owui_id].open) {{
   return {{ status: 'already_open', id: __owui_id }};
 }}
+
+try {{
+  // Best-effort system notification (requires browser permission + user settings).
+  const msg = (__owui_modelName ? (__owui_modelName + ' would like you to answer some questions.') : '');
+  if (msg) {{
+    let settings = {{}};
+    try {{
+      settings = JSON.parse(localStorage.getItem('settings') || '{{}}') || {{}};
+    }} catch {{}}
+    const notifyEnabled = (settings && typeof settings === 'object')
+      ? (settings.notificationEnabled ?? false)
+      : false;
+
+    if (
+      notifyEnabled &&
+      document.visibilityState !== 'visible' &&
+      typeof Notification !== 'undefined' &&
+      Notification.permission === 'granted'
+    ) {{
+      new Notification(__owui_modelName + ' • Open WebUI', {{
+        body: msg,
+        icon: (location && location.origin) ? (location.origin + '/static/favicon.png') : undefined,
+      }});
+    }}
+  }}
+}} catch {{}}
 
 const __owui_prevOverflow = document.body.style.overflow;
 document.body.style.overflow = 'hidden';
@@ -702,6 +730,8 @@ class Tools:
         poll_interval_ms: int = 500,
         __event_call__=None,
         __event_emitter__=None,
+        __model__=None,
+        __metadata__=None,
     ) -> dict[str, Any]:
         """
         Ask the user questions to gather input, clarify requirements, or get decisions during execution.
@@ -759,7 +789,40 @@ class Tools:
         except Exception as exc:
             return {"error": f"Invalid schema: {exc}"}
 
+        def _extract_model_name(obj: Any) -> str | None:
+            if obj is None:
+                return None
+            if isinstance(obj, dict):
+                raw = obj.get("name") or obj.get("id")
+                if raw is None:
+                    return None
+                name = str(raw).strip()
+                return name or None
+            raw = getattr(obj, "name", None) or getattr(obj, "id", None)
+            if raw is None:
+                return None
+            name = str(raw).strip()
+            return name or None
+
+        # Prefer the *selected chat model* from __metadata__ (Open WebUI uses a task model for tool-calling).
+        metadata_model = __metadata__.get("model") if isinstance(__metadata__, dict) else None
+        model_name = (
+            _extract_model_name(metadata_model)
+            or _extract_model_name(__model__)
+            or "The assistant"
+        )
+
         if __event_emitter__ is not None:
+            await __event_emitter__(
+                {
+                    "type": "notification",
+                    "data": {
+                        "type": "info",
+                        "content": f"{model_name} would like you to answer some questions.",
+                    },
+                }
+            )
+
             await __event_emitter__(
                 {
                     "type": "status",
@@ -772,7 +835,7 @@ class Tools:
 
         try:
             request_id = secrets.token_urlsafe(12)
-            open_code = _build_open_execute_code(parsed_schema, request_id)
+            open_code = _build_open_execute_code(parsed_schema, request_id, model_name)
 
             try:
                 open_result = await __event_call__(

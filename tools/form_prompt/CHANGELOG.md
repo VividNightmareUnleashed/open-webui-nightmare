@@ -1,6 +1,15 @@
 ## [0.1.6] - 2026-01-04
 - Adjust cancel `refusal` message wording to be more explicit and consistent.
 
+## [0.1.7] - 2026-01-04
+- Send a user notification when a form is opened.
+
+## [0.1.8] - 2026-01-04
+- Make “model would like you to answer some questions” notifications non-optional.
+
+## [0.1.9] - 2026-01-04
+- Prefer the selected chat model name from `__metadata__["model"]` for notifications (avoids showing the tool-calling task model).
+
 ## [0.1.5] - 2026-01-04
 - Avoid WebSocket call timeouts by opening the UI immediately and polling for results (`timeout_seconds`, `poll_interval_ms`).
 - Add a Cancel hover popover (“Explain model what to do instead”) that optionally returns a `refusal` string.

@@ -29,7 +29,7 @@ def test_prompt_form_validates_schema():
 
 def test_prompt_form_calls_execute_and_returns_result():
     seen_events: list[dict] = []
-    seen_status: list[dict] = []
+    seen_emits: list[dict] = []
 
     async def fake_call(event: dict):
         seen_events.append(event)
@@ -39,7 +39,7 @@ def test_prompt_form_calls_execute_and_returns_result():
         return {"cancelled": False, "values": {"destination": "Tokyo"}}
 
     async def fake_emit(event: dict) -> None:
-        seen_status.append(event)
+        seen_emits.append(event)
 
     tool = mod.Tools()
     out = asyncio.run(
@@ -71,9 +71,10 @@ def test_prompt_form_calls_execute_and_returns_result():
     assert "Explain model what to do instead" in seen_events[0]["data"]["code"]
     assert "Additional info, if the user provided:" in seen_events[0]["data"]["code"]
 
-    assert [e["type"] for e in seen_status] == ["status", "status"]
-    assert seen_status[0]["data"]["done"] is False
-    assert seen_status[1]["data"]["done"] is True
+    assert [e["type"] for e in seen_emits] == ["notification", "status", "status"]
+    assert "would like you to answer some questions" in seen_emits[0]["data"]["content"]
+    assert seen_emits[1]["data"]["done"] is False
+    assert seen_emits[2]["data"]["done"] is True
 
 
 def test_prompt_form_accepts_common_llm_schema_variants():
@@ -153,3 +154,37 @@ def test_prompt_form_timeout_does_not_return_refusal():
     assert "Timed out" in (out.get("error") or "")
     assert "refusal" not in out
     assert "cancelled" not in out
+
+
+def test_prompt_form_prefers_selected_model_name_from_metadata_for_notifications():
+    seen_emits: list[dict] = []
+
+    async def fake_call(event: dict):
+        code = (event.get("data") or {}).get("code") or ""
+        if "JSON.parse(atob(" in code:
+            return {"status": "opened"}
+        return {"cancelled": True}
+
+    async def fake_emit(event: dict) -> None:
+        seen_emits.append(event)
+
+    tool = mod.Tools()
+    out = asyncio.run(
+        tool.AskUserQuestion(
+            schema={
+                "title": "Test",
+                "fields": [{"name": "x", "label": "X", "type": "text"}],
+            },
+            __event_call__=fake_call,
+            __event_emitter__=fake_emit,
+            __model__={"name": "Task Model"},
+            __metadata__={"model": {"name": "Selected Model"}},
+        )
+    )
+
+    assert out.get("cancelled") is True
+    assert seen_emits
+    assert (
+        seen_emits[0]["data"]["content"]
+        == "Selected Model would like you to answer some questions."
+    )
