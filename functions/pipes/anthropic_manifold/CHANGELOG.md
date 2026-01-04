@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.4] - 2026-01-04
+
+### Fixed
+
+- **Tool Result Errors** - Ensure `tool_result.content` is never empty when `is_error=true` (prevents Anthropic API 400s on empty exception messages).
+- **Python 3.11 Compatibility** - Avoid nested f-strings with backslash escapes inside f-string expressions (SyntaxError on Python <=3.11).
+
 ## [1.2.2] - 2026-01-02
 
 ### Fixed

@@ -4,7 +4,7 @@ id: anthropic_manifold
 author: Based on original by justinh-rahb, christian-taillon, Mark Kazakov, Vincent, NIK-NUB, Snav
 description: Full-featured Anthropic Claude API integration with extended thinking, web search, tool calling, and more.
 required_open_webui_version: 0.6.10
-version: 1.2.2
+version: 1.2.4
 license: MIT
 """
 
@@ -1302,7 +1302,8 @@ class Pipe:
                                         old_str = tool_input.get("old_str", "")
                                         new_str = tool_input.get("new_str", "")
                                         if old_str or new_str:
-                                            edit_block = f"\n**Editing `{path}`:**{_format_code_block(f'- {old_str}\n+ {new_str}', 'diff')}"
+                                            diff_text = f"- {old_str}\n+ {new_str}"
+                                            edit_block = f"\n**Editing `{path}`:**{_format_code_block(diff_text, 'diff')}"
                                             accumulated_text += edit_block
                                             while (chunk := _pop_flushable_chunk(force=True)):
                                                 yield chunk
@@ -1542,10 +1543,11 @@ class Pipe:
                     f"Error running {tool_name}",
                     done=True,
                 )
+                error_content = str(e).strip() or repr(e) or e.__class__.__name__
                 return {
                     "type": "tool_result",
                     "tool_use_id": call["id"],
-                    "content": str(e),
+                    "content": error_content,
                     "is_error": True,
                 }
 
