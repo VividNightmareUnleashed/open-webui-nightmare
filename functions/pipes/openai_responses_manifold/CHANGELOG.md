@@ -5,6 +5,11 @@ All notable changes to the OpenAI Responses Manifold pipeline are documented in 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.32] - 2026-01-05
+- Fixed `/responses` 400 errors (`Unknown parameter: 'tool_resources'`) by configuring built-in file tools directly in `tools` (Code Interpreter `container`, File Search `vector_store_ids`) and keeping a fallback retry for older `tool_resources` payloads.
+- Fixed Code Interpreter `container` errors by using the correct object form (`{"type":"auto"}`) and retrying when a provider reports it missing.
+- Added support for companion filters that bypass backend RAG by stashing Open WebUI files under `__metadata__["features"]["openai_responses"]["files"]` when `__files__` is empty.
+
 ## [0.8.31] - 2026-01-04
 - Normalized Open WebUI native tool specs and `tool_choice` to the Responses API format to prevent 400 errors when `function_calling=native`.
 - Improved strict tool schema handling to avoid mutating author-provided schemas while still enforcing `additionalProperties=false`.

@@ -6,7 +6,7 @@ author_url: https://github.com/jrkropp
 git_url: https://github.com/jrkropp/open-webui-developer-toolkit/blob/main/functions/pipes/openai_responses_manifold/openai_responses_manifold.py
 description: Brings OpenAI Response API support to Open WebUI, enabling features not possible via Completions API.
 required_open_webui_version: 0.6.3
-version: 0.8.31
+version: 0.8.32
 license: MIT
 """
 
@@ -916,6 +916,16 @@ class Pipe:
         features_root = features_root if isinstance(features_root, dict) else {}
         openai_features = features if isinstance(features, dict) else {}
 
+        # A companion filter may bypass OpenWebUI's backend RAG by clearing `body["files"]`,
+        # which results in an empty `__files__` injection. In that case, the filter can stash
+        # the original file list under `__metadata__["features"]["openai_responses"]["files"]`.
+        stashed_files = (
+            openai_features.get("files")
+            if isinstance(openai_features.get("files"), list)
+            else None
+        )
+        raw_files = __files__ or stashed_files
+
         code_interpreter_enabled = bool(
             valves.ENABLE_CODE_INTERPRETER_TOOL
             or openai_features.get("code_interpreter", False)
@@ -935,7 +945,7 @@ class Pipe:
         uploaded_openai_file_ids: list[str] = []
 
         should_prepare_file_uploads = bool(
-            __files__
+            raw_files
             and valves.ALLOW_OPENAI_FILE_UPLOADS
             and (
                 (code_interpreter_enabled and model_supports_code_interpreter)
@@ -943,7 +953,7 @@ class Pipe:
             )
         )
 
-        if (__files__ and (code_interpreter_enabled or file_search_enabled)) and not valves.ALLOW_OPENAI_FILE_UPLOADS:
+        if (raw_files and (code_interpreter_enabled or file_search_enabled)) and not valves.ALLOW_OPENAI_FILE_UPLOADS:
             await self._emit_notification(
                 __event_emitter__,
                 content=(
@@ -969,7 +979,7 @@ class Pipe:
 
         if should_prepare_file_uploads:
             openwebui_user_id = str((__user__ or {}).get("id") or "")
-            attachments = self._collect_openwebui_file_attachments(__files__, user_id=openwebui_user_id)
+            attachments = self._collect_openwebui_file_attachments(raw_files, user_id=openwebui_user_id)
 
             try:
                 uploaded_openai_file_ids, openai_file_citations = await self._ensure_openai_file_uploads(
@@ -1026,21 +1036,43 @@ class Pipe:
         # Enable Code Interpreter (files optional; files require uploads)
         if code_interpreter_enabled and model_supports_code_interpreter:
             responses_body.tools = responses_body.tools or []
-            if not any(isinstance(t, dict) and t.get("type") == "code_interpreter" for t in responses_body.tools):
-                responses_body.tools.append({"type": "code_interpreter"})
+            code_interpreter_tool = next(
+                (
+                    tool
+                    for tool in responses_body.tools
+                    if isinstance(tool, dict) and tool.get("type") == "code_interpreter"
+                ),
+                None,
+            )
+            if code_interpreter_tool is None:
+                code_interpreter_tool = {"type": "code_interpreter"}
+                responses_body.tools.append(code_interpreter_tool)
 
-            if uploaded_openai_file_ids:
-                current_resources = responses_body.tool_resources if isinstance(responses_body.tool_resources, dict) else {}
-                responses_body.tool_resources = dict(current_resources)
-                code_resources = responses_body.tool_resources.get("code_interpreter")
-                code_resources = dict(code_resources) if isinstance(code_resources, dict) else {}
-                existing_file_ids = code_resources.get("file_ids") if isinstance(code_resources.get("file_ids"), list) else []
-                code_resources["file_ids"] = self._dedupe_preserve_order(existing_file_ids + uploaded_openai_file_ids)
-                responses_body.tool_resources["code_interpreter"] = code_resources
+            container = code_interpreter_tool.get("container")
+            if isinstance(container, dict):
+                container = dict(container)
+                container.setdefault("type", "auto")
+            elif isinstance(container, str) and container.startswith("cntr"):
+                # Explicit container id provided by the caller; do not override.
+                pass
+            else:
+                container = {"type": "auto"}
+
+            # Prefer container.file_ids over deprecated tool_resources.
+            if uploaded_openai_file_ids and isinstance(container, dict):
+                existing_file_ids = (
+                    container.get("file_ids") if isinstance(container.get("file_ids"), list) else []
+                )
+                container["file_ids"] = self._dedupe_preserve_order(
+                    existing_file_ids + uploaded_openai_file_ids
+                )
+
+            if isinstance(container, dict) or isinstance(container, str):
+                code_interpreter_tool["container"] = container
 
         # Enable File Search (requires uploads + at least one file)
         if file_search_enabled and model_supports_file_search:
-            if not __files__:
+            if not raw_files:
                 await self._emit_notification(
                     __event_emitter__,
                     content="File Search is enabled, but no files are attached to this message.",
@@ -1070,20 +1102,26 @@ class Pipe:
                     )
                 else:
                     responses_body.tools = responses_body.tools or []
-                    if not any(isinstance(t, dict) and t.get("type") == "file_search" for t in responses_body.tools):
-                        responses_body.tools.append({"type": "file_search"})
+                    file_search_tool = next(
+                        (
+                            tool
+                            for tool in responses_body.tools
+                            if isinstance(tool, dict) and tool.get("type") == "file_search"
+                        ),
+                        None,
+                    )
+                    if file_search_tool is None:
+                        file_search_tool = {"type": "file_search"}
+                        responses_body.tools.append(file_search_tool)
 
-                    current_resources = responses_body.tool_resources if isinstance(responses_body.tool_resources, dict) else {}
-                    responses_body.tool_resources = dict(current_resources)
-                    file_search_resources = responses_body.tool_resources.get("file_search")
-                    file_search_resources = dict(file_search_resources) if isinstance(file_search_resources, dict) else {}
                     existing_vs_ids = (
-                        file_search_resources.get("vector_store_ids")
-                        if isinstance(file_search_resources.get("vector_store_ids"), list)
+                        file_search_tool.get("vector_store_ids")
+                        if isinstance(file_search_tool.get("vector_store_ids"), list)
                         else []
                     )
-                    file_search_resources["vector_store_ids"] = self._dedupe_preserve_order(existing_vs_ids + [vector_store_id])
-                    responses_body.tool_resources["file_search"] = file_search_resources
+                    file_search_tool["vector_store_ids"] = self._dedupe_preserve_order(
+                        existing_vs_ids + [vector_store_id]
+                    )
 
         # Check if tools are enabled but native function calling is disabled
         # If so, update the OpenWebUI model parameter to enable native function calling for future requests.
@@ -1760,60 +1798,107 @@ class Pipe:
         # Get or create aiohttp session (aiohttp is used for performance).
         self.session = await self._get_or_init_http_session()
 
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
         url = base_url.rstrip("/") + "/responses"
 
-        buf = bytearray()
-        async with self.session.post(url, json=request_body, headers=headers) as resp:
-            if resp.status >= 400:
-                error_payload: object
-                try:
-                    error_payload = await resp.json()
-                except Exception:
-                    error_payload = await resp.text()
+        original_body = dict(request_body)
+        tool_resources_strategy: Literal["keep", "merge", "drop"] = "keep"
+        container_strategy: Literal["none", "object"] = "none"
 
-                rendered_error = (
-                    json.dumps(error_payload, ensure_ascii=False)
-                    if isinstance(error_payload, (dict, list))
-                    else str(error_payload)
+        last_error: RuntimeError | None = None
+        for attempt_idx in range(6):
+            body_variant = dict(original_body)
+            if tool_resources_strategy == "merge":
+                body_variant = self._strip_tool_resources(dict(original_body), merge_into_tools=True)
+            elif tool_resources_strategy == "drop":
+                body_variant = self._strip_tool_resources(dict(original_body), merge_into_tools=False)
+
+            if container_strategy == "object":
+                body_variant = self._ensure_code_interpreter_container(
+                    body_variant,
+                    container={"type": "auto"},
                 )
-                self.logger.error(
-                    "OpenAI Responses API error (%s): %s",
-                    resp.status,
-                    rendered_error,
-                )
-                raise RuntimeError(f"OpenAI Responses API error ({resp.status}): {rendered_error}")
 
-            async for chunk in resp.content.iter_chunked(4096):
-                buf.extend(chunk)
-                start_idx = 0
-                # Process all complete lines in the buffer
-                while True:
-                    newline_idx = buf.find(b"\n", start_idx)
-                    if newline_idx == -1:
-                        break
-                    
-                    line = buf[start_idx:newline_idx].strip()
-                    start_idx = newline_idx + 1
+            headers = self._build_responses_headers(
+                api_key,
+                streaming=True,
+                request_body=body_variant,
+            )
 
-                    # Skip empty lines, comment lines, or anything not starting with "data:"
-                    if (not line or line.startswith(b":") or not line.startswith(b"data:")):
+            buf = bytearray()
+            async with self.session.post(url, json=body_variant, headers=headers) as resp:
+                if resp.status >= 400:
+                    error_payload = await self._read_openai_error_payload(resp)
+                    rendered_error = self._render_error_payload(error_payload)
+
+                    if tool_resources_strategy == "keep" and self._is_unknown_parameter_error(
+                        error_payload, {"tool_resources"}
+                    ):
+                        tool_resources_strategy = "merge"
+                        self.logger.debug(
+                            "Responses request retry: stripping unsupported `tool_resources` (attempt %d)",
+                            attempt_idx + 1,
+                        )
                         continue
 
-                    data_part = line[5:].strip()
-                    if data_part == b"[DONE]":
-                        return  # End of SSE stream
-                    
-                    # Yield JSON-decoded data
-                    yield json.loads(data_part.decode("utf-8"))
+                    if tool_resources_strategy == "merge" and self._is_unknown_parameter_error(
+                        error_payload, {"file_ids", "vector_store_ids"}
+                    ):
+                        tool_resources_strategy = "drop"
+                        self.logger.debug(
+                            "Responses request retry: dropping merged file_ids/vector_store_ids (attempt %d)",
+                            attempt_idx + 1,
+                        )
+                        continue
 
-                # Remove processed data from the buffer
-                if start_idx > 0:
-                    del buf[:start_idx]
+                    if container_strategy == "none" and self._is_missing_container_error(error_payload):
+                        container_strategy = "object"
+                        self.logger.debug(
+                            "Responses request retry: adding code_interpreter container (attempt %d): %s",
+                            attempt_idx + 1,
+                            rendered_error,
+                        )
+                        continue
+
+                    self.logger.error(
+                        "OpenAI Responses API error (%s): %s",
+                        resp.status,
+                        rendered_error,
+                    )
+                    last_error = RuntimeError(
+                        f"OpenAI Responses API error ({resp.status}): {rendered_error}"
+                    )
+                    raise last_error
+
+                async for chunk in resp.content.iter_chunked(4096):
+                    buf.extend(chunk)
+                    start_idx = 0
+                    # Process all complete lines in the buffer
+                    while True:
+                        newline_idx = buf.find(b"\n", start_idx)
+                        if newline_idx == -1:
+                            break
+
+                        line = buf[start_idx:newline_idx].strip()
+                        start_idx = newline_idx + 1
+
+                        # Skip empty lines, comment lines, or anything not starting with "data:"
+                        if not line or line.startswith(b":") or not line.startswith(b"data:"):
+                            continue
+
+                        data_part = line[5:].strip()
+                        if data_part == b"[DONE]":
+                            return  # End of SSE stream
+
+                        # Yield JSON-decoded data
+                        yield json.loads(data_part.decode("utf-8"))
+
+                    # Remove processed data from the buffer
+                    if start_idx > 0:
+                        del buf[:start_idx]
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("OpenAI Responses API request failed (no attempts)")  # pragma: no cover
 
     async def send_openai_responses_nonstreaming_request(
         self,
@@ -1825,33 +1910,317 @@ class Pipe:
         # Get or create aiohttp session (aiohttp is used for performance).
         self.session = await self._get_or_init_http_session()
 
+        url = base_url.rstrip("/") + "/responses"
+
+        original_body = dict(request_params)
+        tool_resources_strategy: Literal["keep", "merge", "drop"] = "keep"
+        container_strategy: Literal["none", "object"] = "none"
+
+        last_error: RuntimeError | None = None
+        for attempt_idx in range(6):
+            body_variant = dict(original_body)
+            if tool_resources_strategy == "merge":
+                body_variant = self._strip_tool_resources(dict(original_body), merge_into_tools=True)
+            elif tool_resources_strategy == "drop":
+                body_variant = self._strip_tool_resources(dict(original_body), merge_into_tools=False)
+
+            if container_strategy == "object":
+                body_variant = self._ensure_code_interpreter_container(
+                    body_variant,
+                    container={"type": "auto"},
+                )
+
+            headers = self._build_responses_headers(
+                api_key,
+                streaming=False,
+                request_body=body_variant,
+            )
+
+            async with self.session.post(url, json=body_variant, headers=headers) as resp:
+                if resp.status >= 400:
+                    error_payload = await self._read_openai_error_payload(resp)
+                    rendered_error = self._render_error_payload(error_payload)
+
+                    if tool_resources_strategy == "keep" and self._is_unknown_parameter_error(
+                        error_payload, {"tool_resources"}
+                    ):
+                        tool_resources_strategy = "merge"
+                        self.logger.debug(
+                            "Responses request retry: stripping unsupported `tool_resources` (attempt %d)",
+                            attempt_idx + 1,
+                        )
+                        continue
+
+                    if tool_resources_strategy == "merge" and self._is_unknown_parameter_error(
+                        error_payload, {"file_ids", "vector_store_ids"}
+                    ):
+                        tool_resources_strategy = "drop"
+                        self.logger.debug(
+                            "Responses request retry: dropping merged file_ids/vector_store_ids (attempt %d)",
+                            attempt_idx + 1,
+                        )
+                        continue
+
+                    if container_strategy == "none" and self._is_missing_container_error(error_payload):
+                        container_strategy = "object"
+                        self.logger.debug(
+                            "Responses request retry: adding code_interpreter container (attempt %d): %s",
+                            attempt_idx + 1,
+                            rendered_error,
+                        )
+                        continue
+
+                    self.logger.error(
+                        "OpenAI Responses API error (%s): %s",
+                        resp.status,
+                        rendered_error,
+                    )
+                    last_error = RuntimeError(
+                        f"OpenAI Responses API error ({resp.status}): {rendered_error}"
+                    )
+                    raise last_error
+
+                return await resp.json()
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("OpenAI Responses API request failed (no attempts)")  # pragma: no cover
+
+    @staticmethod
+    def _render_error_payload(error_payload: object) -> str:
+        return (
+            json.dumps(error_payload, ensure_ascii=False)
+            if isinstance(error_payload, (dict, list))
+            else str(error_payload)
+        )
+
+    @staticmethod
+    def _is_unknown_parameter_error(error_payload: object, names: set[str]) -> bool:
+        if isinstance(error_payload, dict):
+            err = error_payload.get("error")
+            if isinstance(err, dict):
+                code = err.get("code")
+                param = err.get("param")
+                message = err.get("message")
+
+                if code == "unknown_parameter":
+                    if isinstance(param, str) and any(name in param for name in names):
+                        return True
+                    if isinstance(message, str) and any(name in message for name in names):
+                        return True
+
+                if isinstance(message, str) and message.startswith("Unknown parameter:"):
+                    return any(name in message for name in names)
+
+        if isinstance(error_payload, str) and "Unknown parameter" in error_payload:
+            return any(name in error_payload for name in names)
+
+        return False
+
+    @staticmethod
+    def _is_missing_container_error(error_payload: object) -> bool:
+        if isinstance(error_payload, dict):
+            err = error_payload.get("error")
+            if isinstance(err, dict):
+                code = err.get("code")
+                param = err.get("param")
+                message = err.get("message")
+                if code == "missing_required_parameter":
+                    if isinstance(param, str) and param.endswith(".container"):
+                        return True
+                    if isinstance(message, str) and ".container" in message:
+                        return True
+
+        if isinstance(error_payload, str) and "Missing required parameter" in error_payload:
+            return ".container" in error_payload
+
+        return False
+
+    @staticmethod
+    def _is_invalid_container_type_error(error_payload: object) -> bool:
+        if isinstance(error_payload, dict):
+            err = error_payload.get("error")
+            if isinstance(err, dict):
+                code = err.get("code")
+                param = err.get("param")
+                message = err.get("message")
+
+                if code == "invalid_type" and isinstance(param, str) and param.endswith(".container"):
+                    return True
+
+                if isinstance(message, str) and "Invalid type" in message and ".container" in message:
+                    return True
+
+        if isinstance(error_payload, str) and "Invalid type" in error_payload:
+            return ".container" in error_payload
+
+        return False
+
+    @staticmethod
+    def _ensure_code_interpreter_container(
+        request_body: dict[str, Any],
+        *,
+        container: object,
+    ) -> dict[str, Any]:
+        tools = request_body.get("tools")
+        if not isinstance(tools, list):
+            return request_body
+
+        changed = False
+        updated_tools: list[Any] = []
+        for tool in tools:
+            if not isinstance(tool, dict) or tool.get("type") != "code_interpreter":
+                updated_tools.append(tool)
+                continue
+
+            tool_copy = dict(tool)
+            current = tool_copy.get("container")
+            if "container" not in tool_copy or current == "auto":
+                tool_copy["container"] = container
+                changed = True
+            updated_tools.append(tool_copy)
+
+        if changed:
+            request_body["tools"] = updated_tools
+
+        return request_body
+
+    @staticmethod
+    async def _read_openai_error_payload(resp: aiohttp.ClientResponse) -> object:
+        try:
+            return await resp.json()
+        except Exception:
+            return await resp.text()
+
+    @staticmethod
+    def _request_uses_assistants_tools(request_body: dict[str, Any]) -> bool:
+        tools = request_body.get("tools")
+        if not isinstance(tools, list):
+            return False
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") in {"code_interpreter", "file_search"}:
+                return True
+        return False
+
+    def _build_responses_headers(
+        self,
+        api_key: str,
+        *,
+        streaming: bool,
+        request_body: dict[str, Any],
+    ) -> dict[str, str]:
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        url = base_url.rstrip("/") + "/responses"
+        if streaming:
+            headers["Accept"] = "text/event-stream"
 
-        async with self.session.post(url, json=request_params, headers=headers) as resp:
-            if resp.status >= 400:
-                error_payload: object
-                try:
-                    error_payload = await resp.json()
-                except Exception:
-                    error_payload = await resp.text()
+        # File Search + Code Interpreter are still gated behind Assistants v2 in some providers.
+        if isinstance(request_body.get("tool_resources"), dict) or self._request_uses_assistants_tools(
+            request_body
+        ):
+            headers["OpenAI-Beta"] = "assistants=v2"
 
-                rendered_error = (
-                    json.dumps(error_payload, ensure_ascii=False)
-                    if isinstance(error_payload, (dict, list))
-                    else str(error_payload)
+        return headers
+
+    def _strip_tool_resources(
+        self,
+        request_body: dict[str, Any],
+        *,
+        merge_into_tools: bool,
+    ) -> dict[str, Any]:
+        """Remove unsupported `tool_resources` and optionally merge into `tools` entries."""
+        tool_resources = request_body.pop("tool_resources", None)
+        if not merge_into_tools or not isinstance(tool_resources, dict):
+            return request_body
+
+        tools_value = request_body.get("tools")
+        tools: list[Any] = list(tools_value) if isinstance(tools_value, list) else []
+        updated_tools: list[Any] = []
+        seen_types: set[str] = set()
+
+        for tool in tools:
+            if not isinstance(tool, dict):
+                updated_tools.append(tool)
+                continue
+
+            tool_copy = dict(tool)
+            ttype = tool_copy.get("type")
+            if isinstance(ttype, str):
+                seen_types.add(ttype)
+
+            if ttype == "code_interpreter":
+                resources = tool_resources.get("code_interpreter")
+                if isinstance(resources, dict):
+                    resource_file_ids = resources.get("file_ids")
+                    if isinstance(resource_file_ids, list):
+                        container = tool_copy.get("container")
+                        if isinstance(container, dict):
+                            container = dict(container)
+                            container.setdefault("type", "auto")
+                        elif isinstance(container, str) and container.startswith("cntr"):
+                            # Explicit container id; do not attempt to mutate.
+                            container = container
+                        else:
+                            container = {"type": "auto"}
+
+                        if isinstance(container, dict):
+                            existing = (
+                                container.get("file_ids")
+                                if isinstance(container.get("file_ids"), list)
+                                else []
+                            )
+                            merged = [
+                                *existing,
+                                *[fid for fid in resource_file_ids if isinstance(fid, str)],
+                            ]
+                            container["file_ids"] = self._dedupe_preserve_order(merged)
+
+                        tool_copy["container"] = container
+
+            if ttype == "file_search":
+                resources = tool_resources.get("file_search")
+                if isinstance(resources, dict):
+                    resource_vs_ids = resources.get("vector_store_ids")
+                    if isinstance(resource_vs_ids, list):
+                        existing = (
+                            tool_copy.get("vector_store_ids")
+                            if isinstance(tool_copy.get("vector_store_ids"), list)
+                            else []
+                        )
+                        merged = [
+                            *existing,
+                            *[vid for vid in resource_vs_ids if isinstance(vid, str)],
+                        ]
+                        tool_copy["vector_store_ids"] = self._dedupe_preserve_order(merged)
+
+            updated_tools.append(tool_copy)
+
+        if "code_interpreter" in tool_resources and "code_interpreter" not in seen_types:
+            resources = tool_resources.get("code_interpreter")
+            tool_entry: dict[str, Any] = {"type": "code_interpreter", "container": {"type": "auto"}}
+            if isinstance(resources, dict) and isinstance(resources.get("file_ids"), list):
+                tool_entry["container"]["file_ids"] = self._dedupe_preserve_order(
+                    [fid for fid in resources["file_ids"] if isinstance(fid, str)]
                 )
-                self.logger.error(
-                    "OpenAI Responses API error (%s): %s",
-                    resp.status,
-                    rendered_error,
-                )
-                raise RuntimeError(f"OpenAI Responses API error ({resp.status}): {rendered_error}")
+            updated_tools.append(tool_entry)
 
-            return await resp.json()
+        if "file_search" in tool_resources and "file_search" not in seen_types:
+            resources = tool_resources.get("file_search")
+            tool_entry = {"type": "file_search"}
+            if isinstance(resources, dict) and isinstance(resources.get("vector_store_ids"), list):
+                tool_entry["vector_store_ids"] = self._dedupe_preserve_order(
+                    [vid for vid in resources["vector_store_ids"] if isinstance(vid, str)]
+                )
+            updated_tools.append(tool_entry)
+
+        if updated_tools:
+            request_body["tools"] = updated_tools
+
+        return request_body
     
     async def _get_or_init_http_session(self) -> aiohttp.ClientSession:
         """Return a cached ``aiohttp.ClientSession`` instance.

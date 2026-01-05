@@ -395,13 +395,107 @@ def test_builtin_file_tools_injected(monkeypatch):
 
     sent = captured["body"]
     assert isinstance(sent, mod.ResponsesBody)
-    assert {"type": "code_interpreter"} in (sent.tools or [])
-    assert {"type": "file_search"} in (sent.tools or [])
-    assert sent.tool_resources["code_interpreter"]["file_ids"] == ["file-abc"]
-    assert sent.tool_resources["file_search"]["vector_store_ids"] == ["vs-123"]
+    code_interpreter_tool = next(t for t in (sent.tools or []) if t.get("type") == "code_interpreter")
+    assert code_interpreter_tool["container"]["type"] == "auto"
+    assert code_interpreter_tool["container"]["file_ids"] == ["file-abc"]
+
+    file_search_tool = next(t for t in (sent.tools or []) if t.get("type") == "file_search")
+    assert file_search_tool["vector_store_ids"] == ["vs-123"]
 
     # input_file rewritten from Open WebUI id -> OpenAI file id
     assert sent.input[0]["content"][0]["file_id"] == "file-abc"
+
+    # input_file rewritten from Open WebUI id -> OpenAI file id
+    assert sent.input[0]["content"][0]["file_id"] == "file-abc"
+
+
+def test_builtin_file_tools_use_stashed_files(monkeypatch):
+    pipe = mod.Pipe()
+    pipe.valves = pipe.Valves(
+        ALLOW_OPENAI_FILE_UPLOADS=True,
+        ENABLE_CODE_INTERPRETER_TOOL=True,
+        ENABLE_FILE_SEARCH_TOOL=True,
+    )
+
+    attachment = mod._OpenWebUIFileAttachment(
+        id="f1",
+        filename="doc.txt",
+        local_path="/tmp/doc.txt",
+        size_bytes=2,
+        content_type="text/plain",
+    )
+
+    def fake_collect(raw, user_id):
+        assert raw == [{"id": "f1", "name": "doc.txt"}]
+        assert user_id == "u1"
+        return [attachment]
+
+    monkeypatch.setattr(pipe, "_collect_openwebui_file_attachments", fake_collect)
+
+    async def fake_uploads(*args, **kwargs):
+        return (
+            ["file-abc"],
+            {"file-abc": {"openwebui_file_id": "f1", "filename": "doc.txt"}},
+        )
+
+    async def fake_vs(*args, **kwargs):
+        return "vs-123"
+
+    monkeypatch.setattr(pipe, "_ensure_openai_file_uploads", fake_uploads)
+    monkeypatch.setattr(pipe, "_ensure_vector_store_indexed", fake_vs)
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_streaming_loop(
+        body, valves, event_emitter, metadata, tools, *, openai_file_citations=None
+    ):
+        captured["body"] = body
+        return "ok"
+
+    monkeypatch.setattr(pipe, "_run_streaming_loop", fake_run_streaming_loop)
+
+    async def emitter(_event):
+        return None
+
+    body = {
+        "model": "gpt-4o",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_file", "file_id": "f1"},
+                    {"type": "text", "text": "analyze"},
+                ],
+            }
+        ],
+        "stream": True,
+    }
+
+    result = asyncio.run(
+        pipe.pipe(
+            body,
+            __user__={"id": "u1"},
+            __request__=None,  # unused by this code path
+            __event_emitter__=emitter,
+            __metadata__={
+                "model": {"id": "openai_responses.gpt-4o"},
+                "chat_id": None,
+                "features": {"openai_responses": {"files": [{"id": "f1", "name": "doc.txt"}]}},
+            },
+            __tools__=None,
+            __files__=None,
+        )
+    )
+    assert result == "ok"
+
+    sent = captured["body"]
+    assert isinstance(sent, mod.ResponsesBody)
+    code_interpreter_tool = next(t for t in (sent.tools or []) if t.get("type") == "code_interpreter")
+    assert code_interpreter_tool["container"]["type"] == "auto"
+    assert code_interpreter_tool["container"]["file_ids"] == ["file-abc"]
+
+    file_search_tool = next(t for t in (sent.tools or []) if t.get("type") == "file_search")
+    assert file_search_tool["vector_store_ids"] == ["vs-123"]
 
 
 def test_reasoning_effort_user_valve_applied(monkeypatch):
@@ -490,3 +584,153 @@ def test_user_valves_ignores_legacy_log_level_key():
 )
 def test_build_mcp_tools_invalid(payload):
     assert mod.ResponsesBody._build_mcp_tools(payload) == []
+
+
+def test_responses_request_retries_without_tool_resources(monkeypatch):
+    pipe = mod.Pipe()
+
+    class DummyResponse:
+        def __init__(self, status: int, payload: object):
+            self.status = status
+            self._payload = payload
+
+        async def json(self):
+            return self._payload
+
+        async def text(self):
+            return json.dumps(self._payload)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class DummySession:
+        def __init__(self, responses):
+            self._responses = list(responses)
+            self.calls = []
+
+        def post(self, url, json=None, headers=None):
+            self.calls.append({"url": url, "json": json, "headers": headers})
+            return self._responses.pop(0)
+
+    session = DummySession(
+        [
+            DummyResponse(
+                400,
+                {
+                    "error": {
+                        "message": "Unknown parameter: 'tool_resources'.",
+                        "type": "invalid_request_error",
+                        "param": "tool_resources",
+                        "code": "unknown_parameter",
+                    }
+                },
+            ),
+            DummyResponse(200, {"id": "resp-ok"}),
+        ]
+    )
+
+    async def fake_get_or_init_http_session():
+        return session
+
+    monkeypatch.setattr(pipe, "_get_or_init_http_session", fake_get_or_init_http_session)
+
+    request = {
+        "model": "gpt-4o",
+        "input": "hi",
+        "tools": [{"type": "code_interpreter"}],
+        "tool_resources": {"code_interpreter": {"file_ids": ["file-1"]}},
+    }
+
+    out = asyncio.run(
+        pipe.send_openai_responses_nonstreaming_request(
+            request,
+            api_key="sk-test",
+            base_url="https://api.openai.com/v1",
+        )
+    )
+    assert out == {"id": "resp-ok"}
+    assert len(session.calls) == 2
+    assert session.calls[0]["json"]["tool_resources"]["code_interpreter"]["file_ids"] == ["file-1"]
+    assert session.calls[0]["headers"]["OpenAI-Beta"] == "assistants=v2"
+
+    # Retry removes top-level tool_resources and folds known resources into the tool object.
+    assert "tool_resources" not in session.calls[1]["json"]
+    assert session.calls[1]["json"]["tools"][0]["container"]["file_ids"] == ["file-1"]
+    assert session.calls[1]["headers"]["OpenAI-Beta"] == "assistants=v2"
+
+
+def test_responses_request_retries_with_missing_code_interpreter_container(monkeypatch):
+    pipe = mod.Pipe()
+
+    class DummyResponse:
+        def __init__(self, status: int, payload: object):
+            self.status = status
+            self._payload = payload
+
+        async def json(self):
+            return self._payload
+
+        async def text(self):
+            return json.dumps(self._payload)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class DummySession:
+        def __init__(self, responses):
+            self._responses = list(responses)
+            self.calls = []
+
+        def post(self, url, json=None, headers=None):
+            self.calls.append({"url": url, "json": json, "headers": headers})
+            return self._responses.pop(0)
+
+    session = DummySession(
+        [
+            DummyResponse(
+                400,
+                {
+                    "error": {
+                        "message": "Missing required parameter: 'tools[0].container'.",
+                        "type": "invalid_request_error",
+                        "param": "tools[0].container",
+                        "code": "missing_required_parameter",
+                    }
+                },
+            ),
+            DummyResponse(200, {"id": "resp-ok"}),
+        ]
+    )
+
+    async def fake_get_or_init_http_session():
+        return session
+
+    monkeypatch.setattr(pipe, "_get_or_init_http_session", fake_get_or_init_http_session)
+
+    request = {
+        "model": "gpt-4o",
+        "input": "hi",
+        "tools": [{"type": "code_interpreter"}],
+    }
+
+    out = asyncio.run(
+        pipe.send_openai_responses_nonstreaming_request(
+            request,
+            api_key="sk-test",
+            base_url="https://api.openai.com/v1",
+        )
+    )
+    assert out == {"id": "resp-ok"}
+    assert len(session.calls) == 2
+    assert "container" not in session.calls[0]["json"]["tools"][0]
+    assert session.calls[0]["headers"]["OpenAI-Beta"] == "assistants=v2"
+
+    # Retry injects a default container value into the code interpreter tool.
+    assert session.calls[1]["json"]["tools"][0]["container"] == {"type": "auto"}
+    assert session.calls[1]["headers"]["OpenAI-Beta"] == "assistants=v2"
