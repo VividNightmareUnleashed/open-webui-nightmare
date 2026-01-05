@@ -128,6 +128,11 @@ SPECIAL_TAGS_TO_DISABLE = [
 ]
 ZWS = "\u200b"
 
+# Gemini 3 models require "thought signatures" to be passed back verbatim when
+# continuing a turn that contains tool calls (and some other multi-step behaviors).
+# When the signature isn't available (e.g. edited history or imported chats),
+# Gemini allows a special bypass value to skip validation.
+THOUGHT_SIGNATURE_BYPASS: Final[str] = "skip_thought_signature_validator"
 
 class GenaiApiError(Exception):
     """Custom exception for errors during Genai API interactions."""
@@ -2125,6 +2130,174 @@ class Pipe:
                 )
         return v
 
+    @staticmethod
+    def _model_requires_thought_signatures(model_id: str) -> bool:
+        """
+        Returns True if the active model is expected to enforce thought signature
+        validation for multi-step behaviors (notably Gemini 3).
+        """
+        return "gemini-3" in (model_id or "")
+
+    @staticmethod
+    def _get_part_thought_signature(part: types.Part) -> str | None:
+        """Best-effort extraction of a thought signature from a Part."""
+        for attr in ("thought_signature", "thoughtSignature"):
+            try:
+                value = getattr(part, attr)
+            except Exception:
+                continue
+            if isinstance(value, str) and value:
+                return value
+
+        # Pydantic v2 stores unknown/extra fields in __pydantic_extra__ (and exposes model_extra).
+        for attr in ("model_extra", "__pydantic_extra__"):
+            try:
+                extra = getattr(part, attr)
+            except Exception:
+                continue
+            if isinstance(extra, dict):
+                value = extra.get("thought_signature") or extra.get("thoughtSignature")
+                if isinstance(value, str) and value:
+                    return value
+
+        # Some SDK representations may attach signature-like fields to nested objects.
+        for nested_attr in ("inline_data", "file_data"):
+            try:
+                nested = getattr(part, nested_attr)
+            except Exception:
+                continue
+            if nested is None:
+                continue
+            for attr in ("thought_signature", "thoughtSignature"):
+                try:
+                    value = getattr(nested, attr)
+                except Exception:
+                    continue
+                if isinstance(value, str) and value:
+                    return value
+            for attr in ("model_extra", "__pydantic_extra__"):
+                try:
+                    extra = getattr(nested, attr)
+                except Exception:
+                    continue
+                if isinstance(extra, dict):
+                    value = extra.get("thought_signature") or extra.get("thoughtSignature")
+                    if isinstance(value, str) and value:
+                        return value
+
+        return None
+
+    @staticmethod
+    def _set_part_thought_signature(part: types.Part, signature: str) -> bool:
+        """Best-effort injection of a thought signature into a Part."""
+        for attr in ("thought_signature", "thoughtSignature"):
+            try:
+                setattr(part, attr, signature)
+                return True
+            except Exception:
+                pass
+
+        for attr in ("model_extra", "__pydantic_extra__"):
+            try:
+                extra = getattr(part, attr)
+            except Exception:
+                continue
+            if isinstance(extra, dict):
+                # Prefer the API field name when possible.
+                extra.setdefault("thoughtSignature", signature)
+                extra.setdefault("thought_signature", signature)
+                return True
+
+        # Fall back: attempt to attach to nested objects if the SDK represents it there.
+        for nested_attr in ("inline_data", "file_data"):
+            try:
+                nested = getattr(part, nested_attr)
+            except Exception:
+                continue
+            if nested is None:
+                continue
+            for attr in ("thought_signature", "thoughtSignature"):
+                try:
+                    setattr(nested, attr, signature)
+                    return True
+                except Exception:
+                    pass
+            for attr in ("model_extra", "__pydantic_extra__"):
+                try:
+                    extra = getattr(nested, attr)
+                except Exception:
+                    continue
+                if isinstance(extra, dict):
+                    extra.setdefault("thoughtSignature", signature)
+                    extra.setdefault("thought_signature", signature)
+                    return True
+
+        return False
+
+    @staticmethod
+    def _is_image_part(part: types.Part) -> bool:
+        """Returns True for Parts that represent images (inline or file-based)."""
+        inline_data = getattr(part, "inline_data", None)
+        if inline_data is not None:
+            return True
+
+        file_data = getattr(part, "file_data", None)
+        if file_data is None:
+            return False
+
+        mime_type = getattr(file_data, "mime_type", None)
+        return isinstance(mime_type, str) and mime_type.startswith("image/")
+
+    def _ensure_thought_signatures(self, contents: list[types.Content], model_id: str) -> None:
+        """
+        Ensures the request history is compatible with Gemini 3 thought signature validation.
+
+        If the conversation history contains model-originated image parts or tool calls but is
+        missing required signatures (e.g. edited history or imported chats), inject a known
+        bypass value so requests don't fail with a 4xx validation error.
+        """
+        if not self._model_requires_thought_signatures(model_id):
+            return
+
+        injected = 0
+        for content in contents:
+            if getattr(content, "role", None) != "model":
+                continue
+
+            parts: list[types.Part] = list(getattr(content, "parts", None) or [])
+            if not parts:
+                continue
+
+            # Tool calling: Gemini 3 validates the first functionCall part in each step.
+            first_function_call_part: types.Part | None = None
+            for p in parts:
+                if getattr(p, "function_call", None):
+                    first_function_call_part = p
+                    break
+
+            if first_function_call_part and not self._get_part_thought_signature(
+                first_function_call_part
+            ):
+                if self._set_part_thought_signature(
+                    first_function_call_part, THOUGHT_SIGNATURE_BYPASS
+                ):
+                    injected += 1
+
+            # Image generation / multimodal history: preserve or bypass per image part.
+            for p in parts:
+                if not self._is_image_part(p):
+                    continue
+                if self._get_part_thought_signature(p):
+                    continue
+                if self._set_part_thought_signature(p, THOUGHT_SIGNATURE_BYPASS):
+                    injected += 1
+
+        if injected:
+            log.warning(
+                f"Injected {injected} missing thought_signature value(s) with "
+                f"'{THOUGHT_SIGNATURE_BYPASS}' to satisfy Gemini 3 validation."
+            )
+
     class Valves(BaseModel):
         # FIXME: docstrings don't get markdown rendered in the admin UI currently. rewrite docstrings accordingly.
         GEMINI_FREE_API_KEY: str | None = Field(
@@ -2654,6 +2827,11 @@ class Pipe:
             )
             log.error(error_msg)
             raise ValueError(error_msg)
+
+        # Gemini 3 enforces thought signature validation for some multi-step behaviors.
+        # If the stored chat history is missing signatures (e.g., edited messages or imported chats),
+        # inject the documented bypass value to avoid hard 4xx failures.
+        self._ensure_thought_signatures(contents, model_id)
 
         # Process collected Knowledge files for File Search if enabled.
         file_search_store_names: list[str] = []
@@ -3961,10 +4139,15 @@ class Pipe:
 
             # Append the model's function-call message to the conversation state.
             if candidate_content:
+                self._ensure_thought_signatures([candidate_content], model_id)
                 contents.append(candidate_content)
             else:
                 try:
-                    contents.append(types.Content(role="model", parts=cast(list[types.Part], parts)))
+                    fallback_content = types.Content(
+                        role="model", parts=cast(list[types.Part], parts)
+                    )
+                    self._ensure_thought_signatures([fallback_content], model_id)
+                    contents.append(fallback_content)
                 except Exception:
                     pass
 
@@ -4216,6 +4399,7 @@ class Pipe:
             case types.Part(inline_data=data) if data:
                 # An image part, which can be part of a thought or regular content.
                 # Image parts don't need tag disabling.
+                sig_before = self._get_part_thought_signature(part)
                 processed_text, image_url = await self._process_image_part(
                     data, __metadata__, app
                 )
@@ -4228,6 +4412,9 @@ class Pipe:
                     part.file_data = types.FileData(
                         file_uri=image_url, mime_type=data.mime_type
                     )
+                    # Preserve thought signatures across representation changes.
+                    if sig_before and not self._get_part_thought_signature(part):
+                        self._set_part_thought_signature(part, sig_before)
             case types.Part(executable_code=code) if code:
                 # Code blocks are already formatted and safe.
                 if processed_text := self._process_executable_code_part(code):

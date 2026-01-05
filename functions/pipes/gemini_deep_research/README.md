@@ -8,6 +8,7 @@ Google Gemini Deep Research integration for Open WebUI. Provides autonomous web 
 - **Streaming Progress**: Real-time thinking summaries show research progress as it happens
 - **Follow-up Questions**: Continue research with follow-up questions on the same context
 - **Long-Running Support**: Handles research sessions up to 60 minutes
+- **Stream Resume**: Automatically resumes SSE streaming after disconnects/timeouts (uses `last_event_id`)
 - **Fallback Polling**: Gracefully degrades to polling if SSE streaming fails
 - **No SDK Required**: Uses raw HTTP requests - works with any Open WebUI installation
 
@@ -31,6 +32,7 @@ Google Gemini Deep Research integration for Open WebUI. Provides autonomous web 
 | `POLLING_INTERVAL` | `10.0` | Seconds between polls (fallback mode only) |
 | `MAX_RESEARCH_TIME` | `3600` | Maximum research time in seconds (60 mins) |
 | `CONNECTION_TIMEOUT` | `120` | HTTP connection timeout in seconds |
+| `DEADLINE_RETRIES` | `10` | Number of SSE reconnection attempts before switching to polling |
 
 ## Usage
 
@@ -56,7 +58,7 @@ After receiving a research report, you can ask follow-up questions. The pipe wil
 
 1. Your query is sent to Google's Deep Research agent via the Interactions API
 2. The agent autonomously searches the web using `google_search` and `url_context` tools
-3. Thinking summaries stream back showing research progress (e.g., "Searching for quantum computing breakthroughs...")
+3. The pipe streams thinking summaries (and output text) over SSE and automatically resumes if the stream is interrupted
 4. A comprehensive research report is generated (typically 10-30 minutes)
 5. Follow-up questions continue the conversation using `previous_interaction_id`
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.3] - 2026-01-05
+
+### Fixed
+- Solved streaming timeouts by starting the research in the background first, then streaming via `GET /interactions/{id}` so the pipe can resume after disconnects using `last_event_id`
+- Prevented long-running SSE streams from timing out due to `aiohttp`'s default socket read timeout
+- Streaming fallback now polls the existing interaction instead of restarting a new research task
+
+### Changed
+- Increased default `DEADLINE_RETRIES` from 2 to 10 (now controls SSE reconnection attempts before switching to polling)
+
 ## [0.3.2] - 2026-01-02
 
 ### Added
