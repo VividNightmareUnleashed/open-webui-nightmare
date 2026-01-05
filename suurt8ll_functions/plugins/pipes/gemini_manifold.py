@@ -2719,11 +2719,34 @@ class Pipe:
             if callable(tool.get("callable"))
         }
         function_calling_mode = (__metadata__.get("params") or {}).get("function_calling")
-        native_tool_calling_enabled = (
-            function_calling_mode == "native" and bool(openwebui_callable_tools)
+        model_supports_function_calling = bool(
+            model_config.get(model_id, {}).get("capabilities", {}).get("function_calling", False)
+        )
+        native_tool_calling_enabled = bool(
+            function_calling_mode == "native"
+            and bool(openwebui_callable_tools)
+            and model_supports_function_calling
         )
 
+        if function_calling_mode == "native" and openwebui_callable_tools and not model_supports_function_calling:
+            warn = f"Model '{model_id}' does not support native function calling; ignoring tools."
+            log.warning(warn)
+            event_emitter.emit_toast(warn, "warning")
+
         if native_tool_calling_enabled:
+            # Gemini rejects some combinations of built-in tool use and custom
+            # function calling. When using Open WebUI tools, strip other tool
+            # toggles from the request config to maximize compatibility.
+            if gen_content_conf.tools:
+                log.info(
+                    "Native function calling enabled; clearing built-in Gemini tools from config."
+                )
+            gen_content_conf.tools = []
+            try:
+                gen_content_conf.tool_config = None
+            except Exception:
+                pass
+
             self._add_openwebui_tools_to_config(gen_content_conf, openwebui_callable_tools)
             log.debug(
                 f"Enabled native tool calling with {len(openwebui_callable_tools)} Open WebUI tool(s)."
@@ -3518,15 +3541,107 @@ class Pipe:
         return normalized
 
     @staticmethod
+    def _openai_schema_to_gemini_schema(schema: Any) -> dict[str, Any]:
+        """Convert an OpenAI-style JSON schema into a Gemini-compatible subset.
+
+        Gemini's function-calling `Schema` is a strict subset of JSON Schema and
+        rejects many keywords (e.g. `additionalProperties`). We aggressively
+        simplify schemas to avoid API-side validation errors while still
+        providing helpful structure to the model.
+        """
+        if not isinstance(schema, dict):
+            return {}
+
+        # Unwrap common union/optional constructs.
+        for union_key in ("anyOf", "oneOf", "allOf"):
+            options = schema.get(union_key)
+            if isinstance(options, list) and options:
+                # Prefer the first non-null option.
+                picked: dict[str, Any] | None = None
+                for opt in options:
+                    if not isinstance(opt, dict):
+                        continue
+                    opt_type = opt.get("type")
+                    if opt_type == "null" or opt_type == ["null"]:
+                        continue
+                    picked = opt
+                    break
+                if picked is None:
+                    picked = next((o for o in options if isinstance(o, dict)), {})
+                # Preserve top-level description if present.
+                if isinstance(picked, dict) and schema.get("description") and not picked.get("description"):
+                    picked = dict(picked)
+                    picked["description"] = schema.get("description")
+                return Pipe._openai_schema_to_gemini_schema(picked)
+
+        raw_type = schema.get("type")
+        schema_type: str | None = None
+        if isinstance(raw_type, str):
+            schema_type = raw_type
+        elif isinstance(raw_type, list):
+            non_null = [t for t in raw_type if isinstance(t, str) and t != "null"]
+            schema_type = non_null[0] if non_null else (raw_type[0] if raw_type and isinstance(raw_type[0], str) else None)
+
+        # Build a minimal, whitelisted schema.
+        out: dict[str, Any] = {}
+        if isinstance(schema.get("description"), str) and schema["description"].strip():
+            out["description"] = schema["description"]
+
+        # Handle enums/const.
+        if isinstance(schema.get("enum"), list) and schema["enum"]:
+            out["enum"] = [Pipe._coerce_to_jsonable(v) for v in schema["enum"]]
+        elif "const" in schema:
+            out["enum"] = [Pipe._coerce_to_jsonable(schema.get("const"))]
+
+        # Object shape.
+        props = schema.get("properties") if isinstance(schema.get("properties"), dict) else None
+        if schema_type == "object" or props is not None:
+            out["type"] = "object"
+            properties: dict[str, Any] = {}
+            if props:
+                for key, val in props.items():
+                    if not isinstance(key, str) or not key.strip():
+                        continue
+                    properties[key] = Pipe._openai_schema_to_gemini_schema(val)
+            out["properties"] = properties
+
+            required = schema.get("required") if isinstance(schema.get("required"), list) else None
+            if required:
+                req = [str(k) for k in required if str(k) in properties]
+                if req:
+                    out["required"] = req
+
+            return out
+
+        # Array shape.
+        if schema_type == "array" or "items" in schema:
+            out["type"] = "array"
+            items = schema.get("items")
+            if isinstance(items, list) and items:
+                items = items[0]
+            out["items"] = Pipe._openai_schema_to_gemini_schema(items)
+            return out
+
+        # Primitive types.
+        if schema_type in {"string", "number", "integer", "boolean"}:
+            out["type"] = schema_type
+            return out
+
+        # Fallback: unknown → string.
+        out["type"] = "string"
+        return out
+
+    @staticmethod
     def _add_openwebui_tools_to_config(
         gen_content_conf: types.GenerateContentConfig,
         tools: dict[str, dict[str, Any]],
     ) -> None:
         """Register Open WebUI tools for Gemini native function calling.
 
-        The google-genai SDK can infer tool schemas from Python function
-        signatures. Open WebUI wraps tool callables to remove injected params
-        from signatures, which improves compatibility with google-genai.
+        We build explicit Gemini function declarations from Open WebUI tool
+        specs (OpenAI-compatible JSON schema). Relying on google-genai's
+        automatic schema inference from Python type hints is fragile and fails
+        for complex Pydantic models (e.g. AskUserQuestion.FormSchema).
         """
         if not tools:
             return
@@ -3534,25 +3649,57 @@ class Pipe:
         if gen_content_conf.tools is None:
             gen_content_conf.tools = []
 
+        declarations: list[Any] = []
         added = 0
         for name, tool in tools.items():
-            fn = tool.get("callable")
-            if not callable(fn):
-                log.debug(f"Open WebUI tool '{name}' has no callable; skipping.")
+            spec = tool.get("spec") if isinstance(tool.get("spec"), dict) else None
+            if not spec:
+                log.debug(f"Open WebUI tool '{name}' has no spec; skipping declaration.")
                 continue
-            # Ensure the SDK sees the intended tool name (important for wrapped functions).
+
+            tool_name = spec.get("name") or name
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                continue
+            tool_name = tool_name.strip()
+
+            description = spec.get("description") or ""
+            if not isinstance(description, str):
+                description = str(description)
+
+            params = spec.get("parameters") if isinstance(spec.get("parameters"), dict) else {}
+            params = Pipe._openai_schema_to_gemini_schema(params)
+
+            # google-genai expects a `Schema` for `parameters`, but it also accepts raw dicts.
             try:
-                setattr(fn, "__name__", name)
-                setattr(fn, "__qualname__", name)
+                declarations.append(
+                    types.FunctionDeclaration(
+                        name=tool_name,
+                        description=description,
+                        parameters=params,
+                    )
+                )
             except Exception:
-                pass
-            gen_content_conf.tools.append(fn)
+                declarations.append(
+                    {
+                        "name": tool_name,
+                        "description": description,
+                        "parameters": params,
+                    }
+                )
             added += 1
 
         if added == 0:
             log.warning(
-                "Native tool calling was requested, but no callable Open WebUI tools were provided."
+                "Native tool calling was requested, but no Open WebUI tools could be declared."
             )
+            return
+
+        try:
+            gen_content_conf.tools.append(
+                types.Tool(function_declarations=declarations)
+            )
+        except Exception:
+            gen_content_conf.tools.append({"function_declarations": declarations})
 
     @staticmethod
     def _coerce_to_jsonable(value: Any) -> Any:
@@ -3700,7 +3847,9 @@ class Pipe:
                     )
                 )
 
-        return types.Content(role="function", parts=parts)
+        # Gemini expects function responses as a "user" turn containing one or
+        # more function_response parts.
+        return types.Content(role="user", parts=parts)
 
     async def _execute_openwebui_tool_calls(
         self,
@@ -3785,7 +3934,13 @@ class Pipe:
                 await event_emitter.emit_error(err)
                 return
 
-            parts: list[Any] = list(getattr(res, "parts", None) or [])
+            candidate = self._get_first_candidate(getattr(res, "candidates", None))
+            candidate_content = getattr(candidate, "content", None) if candidate else None
+            parts: list[Any] = list(
+                getattr(candidate_content, "parts", None)
+                or getattr(res, "parts", None)
+                or []
+            )
             calls = self._extract_function_calls_from_parts(parts)
 
             if not calls:
@@ -3805,9 +3960,8 @@ class Pipe:
                 return
 
             # Append the model's function-call message to the conversation state.
-            candidate = self._get_first_candidate(getattr(res, "candidates", None))
-            if candidate and getattr(candidate, "content", None):
-                contents.append(candidate.content)
+            if candidate_content:
+                contents.append(candidate_content)
             else:
                 try:
                     contents.append(types.Content(role="model", parts=cast(list[types.Part], parts)))
